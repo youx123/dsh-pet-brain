@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: blob: http://127.0.0.1:*; media-src data: blob: http://127.0.0.1:*; style-src 'unsafe-inline'; script-src 'self'; connect-src http://127.0.0.1:*" />
+    <title>dsh-pet-brain 桌面助手</title>
+    <style>
+      /* ============================================================
+         视觉口径参考 dsh-pet 旧版：
+           字号基准 f = 宠物宽 462 × 0.0455 ≈ 21px
+           白底 .92~.98 / 1px rgba(0,0,0,.12) 边 / 柔和大阴影
+           正文 #2b2b2b、次要 #9aa0a6、主色 #2b63ff
+         ============================================================ */
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+        user-select: none;
+        -webkit-user-select: none;
+        cursor: default;
+        font-family: "Microsoft YaHei UI", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+      #stage {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: flex-end;
+        justify-content: flex-end;
+        /* 底部留 26px 给状态徽章（窗口高度里也留了同样的量） */
+        padding-bottom: 26px;
+        box-sizing: border-box;
+      }
+      /* 体型固定：旧版 dsh-pet 的 462px（高 = 462 × 9/16） */
+      #pet {
+        position: relative;
+        width: 462px;
+        height: 260px;
+        cursor: grab;
+      }
+      #pet:active {
+        cursor: grabbing;
+      }
+      /**
+       * 双缓冲：两块视频叠在一起，换动作时先让背后那块加载好、播起来，
+       * 再瞬间切显隐 —— 单块 <video> 直接改 src 会有一帧空白，
+       * 在透明窗口上就是"闪一下"。
+       */
+      .petvideo {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+        opacity: 0;
+      }
+      .petvideo.show {
+        opacity: 1;
+      }
+      /* 面板底板 */
+      .card {
+        position: absolute;
+        box-sizing: border-box;
+        background: rgba(255, 255, 255, 0.98);
+        border: 1px solid rgba(0, 0, 0, 0.12);
+        border-radius: 10px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18), 0 2px 6px rgba(0, 0, 0, 0.08);
+        color: #2b2b2b;
+      }
+      #badge {
+        position: absolute;
+        left: 50%;
+        bottom: -22px;
+        transform: translateX(-50%);
+        padding: 3px 11px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 600;
+        white-space: nowrap;
+        background: rgba(255, 255, 255, 0.92);
+        border: 1px solid rgba(0, 0, 0, 0.1);
+        box-shadow: 0 3px 10px rgba(0, 0, 0, 0.12);
+        color: #2b2b2b;
+      }
+      #badge[hidden] {
+        display: none;
+      }
+      /* 气泡：旧版是白底半透 + 小三角 + 圆角 */
+      #bubble {
+        position: absolute;
+        left: 50%;
+        bottom: 100%;
+        transform: translateX(-50%);
+        margin-bottom: 16px;
+        max-width: min(340px, 100%);
+        padding: 10px 14px;
+        border-radius: 16px;
+        font-size: 20px;
+        line-height: 1.6;
+        color: #2b2b2b;
+        font-family: "Yuanti SC", "YouYuan", "幼圆", "Comic Sans MS", "PingFang SC", "Microsoft YaHei", sans-serif;
+        background: rgba(255, 255, 255, 0.94);
+        border: 1px solid rgba(0, 0, 0, 0.1);
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14), 0 1px 3px rgba(0, 0, 0, 0.08);
+        backdrop-filter: blur(6px);
+        animation: pop 0.2s cubic-bezier(0.34, 1.3, 0.6, 1);
+        z-index: 4;
+      }
+      #bubble::after {
+        content: "";
+        position: absolute;
+        left: 50%;
+        top: 100%;
+        transform: translateX(-50%);
+        border: 8px solid transparent;
+        border-top-color: rgba(255, 255, 255, 0.94);
+        border-bottom: none;
+      }
+      #bubble[hidden] {
+        display: none;
+      }
+      /* 气泡里贴的表情图（共享大脑的语义表情 GIF） */
+      #bubble .emoji {
+        display: block;
+        width: 78px;
+        height: 78px;
+        margin: 0 auto 8px;
+        object-fit: contain;
+        border-radius: 10px;
+      }
+      /* 落地压扁 */
+      #pet.squash {
+        animation: squash 220ms cubic-bezier(0.22, 1.2, 0.36, 1);
+      }
+      @keyframes squash {
+        0% {
+          transform: scale(1, 1);
+        }
+        35% {
+          transform: scale(1.14, 0.82);
+        }
+        70% {
+          transform: scale(0.96, 1.06);
+        }
+        100% {
+          transform: scale(1, 1);
+        }
+      }
+      /* 动作面板：网格排布 */
+      #actions {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 6px;
+        /* 动作太多时在列表内部滚动，别把面板撑破、也别让 flex 挤压行高 */
+        max-height: 460px;
+        overflow-y: auto;
+        padding-right: 2px;
+        align-content: start;
+      }
+      #actions::-webkit-scrollbar {
+        width: 5px;
+      }
+      #actions::-webkit-scrollbar-thumb {
+        background: rgba(0, 0, 0, 0.18);
+        border-radius: 999px;
+      }
+      #actions[hidden] {
+        display: none;
+      }
+      .act {
+        border: 0;
+        border-radius: 8px;
+        background: rgba(0, 0, 0, 0.05);
+        color: #2b2b2b;
+        font: inherit;
+        font-size: 12.5px;
+        padding: 8px 6px;
+        cursor: pointer;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .act:hover {
+        background: rgba(43, 99, 255, 0.14);
+        color: #2b63ff;
+      }
+      .act-group {
+        grid-column: 1 / -1;
+        font-size: 11.5px;
+        color: #9aa0a6;
+        letter-spacing: 0.05em;
+        margin-top: 4px;
+      }
+      @keyframes pop {
+        from {
+          opacity: 0;
+          transform: translateX(-50%) scale(0.94) translateY(6px);
+        }
+        to {
+          opacity: 1;
+          transform: translateX(-50%) scale(1) translateY(0);
+        }
+      }
+      /**
+       * 菜单/面板出现时窗口会长高（底边不动），Windows 透明窗口在 setBounds
+       * 的那一帧偶尔会露出空白。加一层极短的淡入，出现过程是"浮上来"而不是"闪一下"。
+       */
+      @keyframes riseIn {
+        from {
+          opacity: 0;
+        }
+        to {
+          opacity: 1;
+        }
+      }
+      #menu:not([hidden]),
+      #panel:not([hidden]) {
+        animation: riseIn 0.12s ease-out;
+      }
+      /* 右键菜单：旧版是白底小圆角列 + 蓝色 hover */
+      #menu {
+        position: absolute;
+        right: 10px;
+        bottom: 100%;
+        margin-bottom: 12px;
+        min-width: 176px;
+        padding: 4px;
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+        max-height: min(62vh, 460px);
+        overflow-y: auto;
+        z-index: 3;
+      }
+      #menu[hidden] {
+        display: none;
+      }
+      .menu-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        padding: 6px 12px;
+        border: 0;
+        border-radius: 6px;
+        background: transparent;
+        color: #2b2b2b;
+        font: inherit;
+        font-size: 13px;
+        line-height: 1.5;
+        text-align: left;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      .menu-item:hover {
+        background: rgba(43, 99, 255, 0.14);
+      }
+      .menu-sep {
+        height: 1px;
+        margin: 3px 6px;
+        background: rgba(0, 0, 0, 0.1);
+      }
+      /* ---- 面板（聊天 / 余额 / 心情）------------------------------------ */
+      #panel {
+        position: absolute;
+        left: 50%;
+        bottom: 100%;
+        transform: translateX(-50%);
+        margin-bottom: 16px;
+        width: 380px;
+        box-sizing: border-box;
+        padding: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        z-index: 2;
+        /* 窗口尺寸固定（宠物 + 上方 600px HUD 预留区），面板长在这个预留区里。
+           不能用 vh：预留区高度跟窗口绑死，vh 会自我压缩。588 = 600 预留 - 12 间距 */
+        max-height: 588px;
+        overflow: hidden;
+      }
+      #panel[hidden] {
+        display: none;
+      }
+      #panelTitle {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-size: 12.5px;
+        letter-spacing: 0.04em;
+        color: #9aa0a6;
+        font-weight: 600;
+      }
+      #panelClose {
+        border: 0;
+        background: transparent;
+        color: #9aa0a6;
+        font-size: 14px;
+        line-height: 1;
+        padding: 2px 5px;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      #panelClose:hover {
+        background: rgba(43, 99, 255, 0.14);
+        color: #2b63ff;
+      }
+      /* 面板高度封顶：内容再多就在面板内部滚动，别让窗口顶出屏幕 */
+      #log {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        height: 178px;
+        overflow-y: auto;
+        padding-right: 2px;
+      }
+      #log[hidden],
+      #info[hidden],
+      #row[hidden] {
+        display: none;
+      }
+      #log::-webkit-scrollbar {
+        width: 5px;
+      }
+      #log::-webkit-scrollbar-thumb {
+        background: rgba(0, 0, 0, 0.18);
+        border-radius: 999px;
+      }
+      .msg {
+        max-width: 88%;
+        padding: 7px 11px;
+        border-radius: 12px;
+        font-size: 13px;
+        line-height: 1.55;
+        word-break: break-word;
+        user-select: text;
+        -webkit-user-select: text;
+      }
+      .msg.me {
+        align-self: flex-end;
+        background: #2b63ff;
+        color: #fff;
+        border-bottom-right-radius: 4px;
+      }
+      .msg.pet {
+        align-self: flex-start;
+        background: rgba(43, 99, 255, 0.1);
+        color: #2b2b2b;
+        border-bottom-left-radius: 4px;
+      }
+      .msg.typing {
+        align-self: flex-start;
+        color: #9aa0a6;
+        background: rgba(43, 99, 255, 0.07);
+      }
+      #row {
+        display: flex;
+        gap: 6px;
+      }
+      #input {
+        flex: 1;
+        min-width: 0;
+        padding: 8px 11px;
+        border: 1px solid rgba(0, 0, 0, 0.14);
+        border-radius: 9px;
+        background: #fafafa;
+        color: #2b2b2b;
+        font: inherit;
+        font-size: 13px;
+        outline: none;
+        user-select: text;
+        -webkit-user-select: text;
+      }
+      #input:focus {
+        border-color: rgba(43, 99, 255, 0.55);
+        background: #fff;
+      }
+      #send {
+        border: 0;
+        padding: 0 14px;
+        border-radius: 9px;
+        background: #2b63ff;
+        color: #fff;
+        font: inherit;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      #send:disabled {
+        opacity: 0.55;
+        cursor: default;
+      }
+      /* 余额 / 心情共用的信息区 */
+      #info {
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+      }
+      .big {
+        display: flex;
+        align-items: baseline;
+        gap: 7px;
+      }
+      .big b {
+        font-size: 28px;
+        font-weight: 800;
+        color: #2b2b2b;
+      }
+      .pill {
+        padding: 2px 9px;
+        border-radius: 999px;
+        font-size: 11.5px;
+        font-weight: 600;
+        color: #2b63ff;
+        background: rgba(43, 99, 255, 0.1);
+      }
+      .stat {
+        display: flex;
+        justify-content: space-between;
+        font-size: 12.5px;
+        color: #6b7280;
+      }
+      .stat span:last-child {
+        font-weight: 600;
+        color: #2b2b2b;
+      }
+      .dim {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        color: #6b7280;
+      }
+      .dim i {
+        font-style: normal;
+        width: 30px;
+        color: #9aa0a6;
+      }
+      .dim u {
+        flex: 1;
+        height: 6px;
+        border-radius: 999px;
+        background: rgba(0, 0, 0, 0.08);
+        overflow: hidden;
+        text-decoration: none;
+      }
+      .dim u b {
+        display: block;
+        height: 100%;
+        border-radius: 999px;
+        background: linear-gradient(90deg, #2b63ff, #7aa2ff);
+        transition: width 0.35s ease;
+      }
+      .dim em {
+        font-style: normal;
+        width: 16px;
+        text-align: right;
+        color: #9aa0a6;
+      }
+      .hint {
+        font-size: 11px;
+        color: #9aa0a6;
+        line-height: 1.45;
+      }
+      .warn {
+        font-size: 12px;
+        color: #e53935;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="stage">
+      <div id="pet">
+        <video id="videoA" class="petvideo show" autoplay muted playsinline></video>
+        <video id="videoB" class="petvideo" autoplay muted playsinline></video>
+        <div id="badge" hidden></div>
+        <div id="bubble" class="card" hidden></div>
+        <div id="menu" class="card" hidden></div>
+        <div id="panel" class="card" hidden>
+          <div id="panelTitle">
+            <span id="panelName">聊天</span>
+            <button id="panelClose" type="button" aria-label="关闭">✕</button>
+          </div>
+          <div id="log" hidden></div>
+          <div id="actions" hidden></div>
+          <div id="info" hidden></div>
+          <div id="row" hidden>
+            <input id="input" type="text" placeholder="跟小深说点什么…" autocomplete="off" />
+            <button id="send" type="button">发送</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script src="./renderer.js"></script>
+  </body>
+</html>

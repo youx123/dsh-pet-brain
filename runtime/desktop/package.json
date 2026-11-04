@@ -1,0 +1,8 @@
+{
+  "name": "dsh-pet-brain-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "dsh-pet-brain 的桌面助手运行时（独立 Electron 进程，透明置顶窗口）",
+  "main": "main.js",
+  "type": "commonjs"
+}

@@ -1,0 +1,54 @@
+{
+  "name": "dsh-pet-brain",
+  "version": "0.1.0",
+  "description": "有大脑的桌宠：人设、心情和记忆全部来自 dsh-shared-brain，心情档位驱动动作，每轮对话现场召回记忆拼 system prompt。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "assets/webm",
+    "cordis.patch.yml",
+    "NOTICE.md",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "desktop-pet",
+    "pet",
+    "cordis",
+    "react",
+    "shared-brain"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-connection"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": "*",
+    "@deepseek-ai/dsh-client-connection": "*",
+    "react": ">=18.2.0"
+  }
+}
