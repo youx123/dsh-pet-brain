@@ -59,7 +59,7 @@ dsh plugin add <克隆下来的目录绝对路径>
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
 | GET | `/pet-brain/config` | 轮询间隔、尺寸、动画名表、档位→动画映射 |
-| GET | `/pet-brain/state` | 当前人设名、心情、档位、七维、最近原因、建议动作、最近 3 条记忆、工作状态 |
+| GET | `/pet-brain/state` | 当前人设名、心情、档位、七维、最近原因、建议动作、最近 3 条记忆、工作状态、`speech`（最近 3 句自己说的话） |
 | GET | `/pet-brain/usage` | 余额 / 今日已用 / 近 7 天 / 是否优惠时段（`?refresh=1` 跳过 60s 缓存） |
 | POST | `/pet-brain/chat` | `{text, history}` → `{reply, mood, action, memories}` |
 | GET | `/pet-brain/proactive` | 共享大脑主动互动决策的只读视图：该不该说、什么语气、什么话题、什么时候再说 |
@@ -144,6 +144,21 @@ dsh plugin add <克隆下来的目录绝对路径>
 
 **工作状态**：直接读宿主的 `ctx.agents.list()`（Agent 实例带 `status` 字段）。
 注意 `ctx.on('agent/status')` 是 Scoped 事件，插件 scope 里收不到别的会话，别在那儿浪费时间。
+
+**5. 自己的一本小账本（`chat-log.json`）**
+共享大脑的 `proactive-history.json` 只记「今天说了几句、什么时候说的、用过哪些话题」，
+**不记内容** —— 桌宠主动开口时不知道自己上一句说了什么，容易复读；
+面板里的聊天记录也只在面板开着时才算上下文。
+
+所以桌宠另有一份 `%DSH_HOME%/dsh-pet-brain/chat-log.json`（最近 60 条）：
+
+- `/chat` 成功 → 记一条老大说的 + 一条自己回的
+- `/speak` 成功 → 记一条自己主动说的
+- 下一次 `/speak` 的提示里会带上「【你刚说过】…」和自己的「【老大最近跟你说过】…」，
+  明确告诉模型别重复、换个说法
+- 下一次 `/chat` 的提示里会带上「【刚刚聊过】」（最近 6 条，标好谁说的），
+  所以桌宠能接上话 —— 问它「我刚说我今天想吃点好的，你还记得吗」它答得出来
+- `/state` 的 `speech` 字段会回最近 3 句自己说的话
 
 ## 交互
 
