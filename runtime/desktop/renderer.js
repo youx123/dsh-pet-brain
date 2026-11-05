@@ -47,6 +47,8 @@
   let polledOnce = false;
   /** 面板种类：'' 关着 / 'chat' / 'usage' / 'mood'（提前声明，mousemove 回调里要用） */
   let panelKind = '';
+  /** 正在跟共享大脑接话：别同时来两次，说成一堆 */
+  let hostFollowBusy = false;
 
   // ---- 与宿主通信 -------------------------------------------------------
   async function api(path, init) {
@@ -241,12 +243,34 @@
    * 冒一个气泡。
    * emojiKey 是共享大脑的语义表情键（neutral / nodding / happy …），
    * 走它自己的 /api/dsh-shared-brain/emoji/<key>.gif 路由贴图。
+   *
+   * opts.record：这句话是不是"本地自己冒的"（比如点一下先顶一句短话）。
+   * 宿主那边已经记过账的（/speak、/chat 的回复）不要再记一遍，
+   * 否则账本里同一条会出现两次。
    */
-  function say(text, ms = 8000, emojiKey = '') {
+  function say(text, ms = 8000, emojiKey = '', opts = {}) {
     if (!text) return;
+    // 桌宠说的每一句都进会话记录：气泡和聊天面板是同一个会话的两个视图，
+    // 记在这儿，左键弹的气泡和右键开的聊天面板才连得上。
+    pushChatLine('assistant', text, opts.kind || 'local');
+    if (opts.record) {
+      // 本地短句宿主那边不知道 → 补记进账本，面板里也能看到
+      void api('/pet-brain/chatlog', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ role: 'assistant', kind: opts.kind || 'local', text }),
+      })
+        .then(() => {
+          if (panelKind === 'chat') renderChat();
+        })
+        .catch(() => {});
+    }
     // 菜单或面板开着的时候不弹气泡：两者都往上长，会叠在一起互相盖住
     if (!menu.hidden || (typeof panelKind === 'string' && panelKind)) {
       ping('say.suppressed', String(text).slice(0, 20));
+      // 但话不能丢：聊天面板开着就写进日志，没开就在徽章上留个未读提示
+      if (panelKind === 'chat') renderChat();
+      else markUnread();
       return;
     }
     // 说话前先站住：一边走一边冒泡，气泡跟着窗口飘，看着乱
@@ -276,12 +300,12 @@
    * 问宿主「我现在该不该开口、说什么」。
    * 决策全在宿主侧（共享大脑的 decideProactive），这里只负责把结果显示出来。
    */
-  async function askHostSpeak(force = false) {
+  async function askHostSpeak(force = false, extra = {}) {
     try {
       const res = await api('/pet-brain/speak', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(force ? { force: true } : {}),
+        body: JSON.stringify({ ...extra, ...(force ? { force: true } : {}) }),
       });
       if (res?.action !== 'speak' || !res?.text) return null;
       return res;
@@ -307,11 +331,11 @@
   function scheduleChatter(delayMs = 0) {
     const wait = delayMs || 90_000 + Math.random() * 150_000;
     setTimeout(async () => {
-      const busy = dragging || panelKind || !bubble.hidden || menu.hidden === false;
+      const busy = dragging || panelKind || !bubble.hidden || menu.hidden === false || hostFollowBusy;
       if (!quiet && !busy && state) {
         const res = await askHostSpeak(false);
         if (res?.text) {
-          say(res.text, 9000, res.emoji || '');
+          say(res.text, 15000, res.emoji || '', { kind: 'proactive' });
           if (res.actions?.length) playAnim(res.actions[Math.floor(Math.random() * res.actions.length)], false);
           ping('speak.ok', `${res.reason}/${res.tone} ${res.text.slice(0, 24)}`);
         } else {
@@ -610,7 +634,7 @@
     sleepPhase = 'start';
     clearTimeout(sleepTimer);
     ping('sleep.start', auto ? 'auto' : 'manual');
-    if (auto) say('困了，先眯一会儿…', 4000);
+    if (auto) say('困了，先眯一会儿…', 4000, '', { record: true });
     const ok = await playAnim(SLEEP.start, false, 1, () => sleepLoop());
     if (!ok) {
       sleeping = false;
@@ -712,10 +736,10 @@
   function baifanDone() {
     baifanPhase = -1;
     ping('baifan.done', 'ate');
-    say('呼——吃饱啦～');
+    say('呼——吃饱啦～', 8000, '', { record: true });
     askHostSpeak(true).then((res) => {
       if (!res?.text) return;
-      say(res.text, 9000, res.emoji || '');
+      say(res.text, 15000, res.emoji || '', { kind: 'proactive' });
       ping('baifan.speak', res.text.slice(0, 30));
     });
   }
@@ -729,13 +753,13 @@
       return;
     }
     // 先给一句本地短句，点了立刻有反应（模型要两秒多，等着会以为没点中）
-    say(withEmoji(pick(BAND_LINES[bandId()] || BAND_LINES.unknown)));
+    say(withEmoji(pick(BAND_LINES[bandId()] || BAND_LINES.unknown)), 9000, '', { record: true });
     playAnim(actionOf(state), false);
     // 再让宿主按共享大脑的调子重新说一句，来了就替换掉。
     // 这里不再跟着换动作 —— 上面已经动过一次，模型回来再换就是同一次点击换两回，看着闪。
     askHostSpeak(true).then((res) => {
       if (!res?.text) return;
-      say(res.text, 9000, res.emoji || '');
+      say(res.text, 15000, res.emoji || '', { kind: 'proactive' });
       ping('tap.speak', res.text.slice(0, 30));
     });
   }
@@ -750,7 +774,7 @@
   );
 
   pet.addEventListener('dblclick', () => {
-    say('嘿嘿，别挠了');
+    say('嘿嘿，别挠了', 8000, '', { record: true });
     playAnim(cfg?.animations?.click?.[0] || '点击回应-开心跃动', false);
   });
 
@@ -845,7 +869,7 @@
 
   function toggleQuiet() {    quiet = !quiet;
     localStorage.setItem('pet-desk:quiet', quiet ? '1' : '0');
-    say(quiet ? '好，那我少说点' : '行，那我多说点');
+    say(quiet ? '好，那我少说点' : '行，那我多说点', 8000, '', { record: true });
   }
 
   // ---- 面板：聊天 / 余额 / 心情 ------------------------------------------
@@ -965,6 +989,11 @@
     syncGrow();
     if (kind === 'chat') {
       renderChat();
+      // 拉一次宿主账本：桌宠在气泡里说过的话、主动搭过的话，面板里都要看得见
+      void syncChatLog().then(() => {
+        renderChat();
+        clearUnread();
+      });
       setTimeout(() => inputEl.focus(), 70);
     } else if (kind === 'usage') {
       renderUsage();
@@ -989,17 +1018,81 @@
     closePanel();
   });
 
+  /* ---- 会话记录：气泡和聊天面板共用一份 ---- */
+  /**
+   * 桌宠这边的会话记录（本地那份）。
+   *
+   * 以前气泡和聊天面板各记各的：气泡里说的话，面板里看不见；
+   * 面板里说的话，气泡里也没有 —— 老大点两处，像在跟两只会说话的东西打交道。
+   * 现在两边共用一份会话：桌宠说的每一句都记在这儿，再跟宿主账本合并，
+   * 就是完整的一条对话线。
+   */
+  const localSpeech = [];
+  function pushChatLine(role, text, kind = 'local') {
+    const t = String(text || '').trim();
+    if (!t) return;
+    localSpeech.push({
+      role: role === 'user' ? 'user' : 'assistant',
+      kind,
+      text: t.slice(0, 200),
+      at: Date.now(),
+    });
+    if (localSpeech.length > 60) localSpeech.splice(0, localSpeech.length - 60);
+  }
+
+  /** 宿主账本（聊过的、主动搭过的都记在那边） */
+  let hostLog = { lines: [] };
+
+  /** 有话没显示出来：徽章上挂个提示，别让老大以为它没说话 */
+  let unread = 0;
+  function markUnread() {
+    unread += 1;
+    paintBadge();
+  }
+  function clearUnread() {
+    if (!unread) return;
+    unread = 0;
+    paintBadge();
+  }
+
   /* ---- 聊天 ---- */
-  /** 显示用的气泡记录 */
-  const chatLog = [];
+  /** 拉一次宿主账本，让面板里的内容和桌宠说过的话对齐 */
+  async function syncChatLog() {
+    try {
+      const res = await api('/pet-brain/chatlog?limit=60');
+      if (res && Array.isArray(res.lines)) hostLog = { lines: res.lines };
+    } catch (e) {
+      /* 拉不到就先用本地的，别把面板搞空 */
+    }
+    return hostLog;
+  }
+
+  /** 本地记录 + 宿主账本，按时间排好、去掉重复 */
+  function mergedChat() {
+    const out = [];
+    const seen = new Map();
+    const add = (m) => {
+      const key = `${m.role}|${m.text}`;
+      const prev = seen.get(key);
+      // 同一条别显示两遍（本地那份和宿主那份是同一条，只是时间戳差一点）
+      if (prev !== undefined && Math.abs((m.at ?? 0) - prev) < 4000) return;
+      seen.set(key, m.at ?? 0);
+      out.push(m);
+    };
+    for (const m of hostLog.lines ?? []) add(m);
+    for (const m of localSpeech) add(m);
+    out.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
+    return out.slice(-60);
+  }
   /** 发给模型的历史，只留最近 8 条，避免上下文越滚越长 */
   const chatHistory = [];
   let sending = false;
 
   function renderChat() {
     logEl.textContent = '';
-    if (!chatLog.length) logEl.appendChild(el('div', 'msg pet', '在的，说吧。'));
-    for (const m of chatLog) logEl.appendChild(el('div', 'msg ' + m.role, m.text));
+    const rows = mergedChat();
+    if (!rows.length) logEl.appendChild(el('div', 'msg pet', '在的，说吧。'));
+    for (const m of rows) logEl.appendChild(el('div', 'msg ' + (m.role === 'user' ? 'me' : 'pet'), m.text));
     if (sending) logEl.appendChild(el('div', 'msg typing', '…'));
     logEl.scrollTop = logEl.scrollHeight;
   }
@@ -1008,7 +1101,7 @@
     const text = inputEl.value.trim();
     if (!text || sending) return;
     inputEl.value = '';
-    chatLog.push({ role: 'me', text });
+    pushChatLine('user', text, 'chat');
     sending = true;
     renderChat();
     try {
@@ -1018,19 +1111,22 @@
         body: JSON.stringify({ text, history: chatHistory.slice(-8) }),
       });
       const reply = res?.reply || '……';
-      chatLog.push({ role: 'pet', text: reply });
+      pushChatLine('assistant', reply, 'chat');
       chatHistory.push({ role: 'user', text }, { role: 'assistant', text: reply });
       if (res?.mood) state = { ...state, mood: res.mood };
       paintBadge();
       playAnim(res?.action || actionOf(state), false);
+      // 面板里聊完也给个气泡：两个视图要互相能看见
+      say(reply, 12000, '', { kind: 'chat' });
       ping('chat.ok', reply.slice(0, 40));
     } catch (e) {
-      chatLog.push({ role: 'pet', text: '连不上宿主，等会儿再试。' });
+      pushChatLine('assistant', '连不上宿主，等会儿再试。', 'chat');
       ping('chat.fail', String(e?.message || e));
     } finally {
       sending = false;
       renderChat();
       inputEl.focus();
+      void syncChatLog().then(() => renderChat());
     }
   }
 
@@ -1137,10 +1233,17 @@
     }
     badge.hidden = false;
     badge.textContent = `${m.mood} · ${m.band?.label || '—'}`;
+    // 有话没显示出来（面板/菜单开着，气泡被压住了）→ 徽章上挂个提示
+    if (unread > 0) badge.textContent += ` · 💬${unread}`;
   }
 
   badge.addEventListener('click', (e) => {
     e.stopPropagation();
+    // 有没看完的话 → 先开聊天面板，别让老大点的不是他以为的那个
+    if (unread > 0) {
+      openPanel('chat');
+      return;
+    }
     if (panelKind === 'mood') closePanel();
     else openPanel('mood');
   });
@@ -1170,7 +1273,7 @@
             playAnim('待机呼吸休闲', true);
             ping('work.idle', 'turns=' + (w.turns ?? 0));
           }
-          if (!quiet && !panelKind && bubble.hidden) say('这轮干完啦，歇会儿？');
+          if (!quiet && !panelKind && bubble.hidden) say('这轮干完啦，歇会儿？', 9000, '', { record: true });
         }
         lastWorkStatus = w.status;
       }
@@ -1184,6 +1287,41 @@
           const pool = state.actions;
           playAnim(pool[Math.floor(Math.random() * pool.length)], true);
         }
+      }
+
+      // 共享大脑主会话刚开口、而这一条我还没接过 → 跟着接一句。
+      // 以前这事儿接不上：判定只留了一个 3 分钟的时间窗，共享大脑今天
+      // 额度用完、隔很久才说一句，桌宠永远等不到那个窗口。
+      // 现在宿主那边记着"接到哪一条"，这边只看"有没有新的"。
+      const h = state?.host;
+      if (
+        h &&
+        h.at &&
+        h.at > (h.seenAt ?? 0) &&
+        !quiet &&
+        !dragging &&
+        !sleeping &&
+        !walking &&
+        !hostFollowBusy
+      ) {
+        hostFollowBusy = true;
+        void api('/pet-brain/speak', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ follow: true }),
+        })
+          .then((res) => {
+            if (res?.action === 'speak' && res?.text) {
+              say(res.text, 15000, res.emoji || '', { kind: 'proactive' });
+              ping('host.follow', `${res.reason} ${res.text.slice(0, 24)}`);
+            } else {
+              ping('host.follow.skip', res?.reason || 'silent');
+            }
+          })
+          .catch((e) => ping('host.follow.fail', String(e?.message || e)))
+          .finally(() => {
+            hostFollowBusy = false;
+          });
       }
     } catch (e) {
       if (!polledOnce) ping('state.fail', String(e?.message || e));
@@ -1294,7 +1432,7 @@
       out.push('text=' + String(res.text || '').slice(0, 40));
       out.push('actions=' + (res.actions || []).length);
       if (res.text) {
-        say(res.text, 9000, res.emoji || '');
+        say(res.text, 15000, res.emoji || '', { kind: 'proactive' });
         out.push('bubble=' + (bubble.hidden ? 'hidden' : 'shown'));
         out.push('emojiImg=' + bubble.querySelectorAll('img.emoji').length);
       }
