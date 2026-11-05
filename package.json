@@ -16,6 +16,7 @@
   },
   "files": [
     "lib",
+    "runtime",
     "assets/webm",
     "cordis.patch.yml",
     "NOTICE.md",
