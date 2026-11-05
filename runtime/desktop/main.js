@@ -278,6 +278,19 @@ function createWindow() {
           } else if (auto === 'probe') {
             const report = await win.webContents.executeJavaScript('window.__petDeskTest.probe()');
             log('probe ' + report);
+          } else if (auto === 'sleep') {
+            // 睡觉三段接力：入睡 → 循环 → 叫醒 → 回待机
+            const p = win.webContents.executeJavaScript('window.__petDeskTest.sleepTest()');
+            // 等 13 秒：入睡段 10 秒素材播完，这会儿正在循环段（睡着的姿势），抓一张
+            await new Promise((r) => setTimeout(r, 13000));
+            try {
+              const shot = await win.webContents.capturePage();
+              fs.writeFileSync(path.join(require('node:os').tmpdir(), 'dsh-pet-brain-sleep-shot.png'), shot.toPNG());
+            } catch {
+              /* 抓不到就算了 */
+            }
+            const report = await p;
+            log('sleep ' + report);
           } else if (auto === 'menu') {
             // 派发一次右键，验证菜单样式
             await win.webContents.executeJavaScript(

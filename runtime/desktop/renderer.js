@@ -101,8 +101,10 @@
    * 没播成返回 null。
    * rate 是播放倍速：素材统一 10 秒，走位时压到 1.5 倍，走起来不拖沓。
    */
-  async function playAnim(name, loop = true, rate = 1) {
+  async function playAnim(name, loop = true, rate = 1, onEnded = null) {
     if (!name || name === currentAnim) return null;
+    // 播别的动作就等于醒了：睡眠状态要跟着收掉（不然徽章一直挂着睡觉中）
+    if (sleeping && !SLEEP_CLIPS.has(name)) cancelSleep();
     const token = ++animToken;
     currentAnim = name;
     try {
@@ -117,6 +119,10 @@
       const back = vids[1 - front];
       back.loop = loop;
       back.playbackRate = rate;
+      // 播完回调：睡觉三段接力靠它接下一段。另一块 buffer 上的旧回调要先清掉，
+      // 否则上一段播完会把已经换掉的动作又触发一遍。
+      for (const v of vids) if (v !== back) v.onended = null;
+      back.onended = typeof onEnded === 'function' ? onEnded : null;
       back.src = url;
       back.load();
       await waitPlayable(back);
@@ -505,6 +511,7 @@
       menu.hidden &&
       lastWorkStatus !== 'running' &&
       !walking &&
+      !sleeping &&
       Date.now() - lastWalkAt > 25_000
     );
   }
@@ -554,9 +561,114 @@
     }, 35_000 + Math.random() * 55_000);
   })();
 
+  // ---- 睡觉三段接力 -----------------------------------------------------
+  // 照抄上游 dsh-pet 的 sleep 玩法：入睡(睡觉-开始) → 循环(睡觉-循环) → 起床(睡觉-起来)。
+  // 中间那段必须 loop=true 播（上游要求循环段首尾帧完全相同，否则循环处会跳）。
+  const SLEEP = { start: '睡觉-开始', loop: '睡觉-循环', end: '睡觉-起来', maxMs: 45_000, menu: '😴 睡一觉' };
+  const SLEEP_CLIPS = new Set([SLEEP.start, SLEEP.loop, SLEEP.end]);
+  let sleeping = false;
+  let sleepPhase = '';
+  let sleepTimer = 0;
+  let lastSleepAt = 0;
+
+  /**
+   * 睡觉被打断：拖走、点别的动作、干活去了 —— 直接把睡眠状态收掉，
+   * 不然宠物会一直挂着「💤 睡觉中」却已经在干别的了。
+   */
+  function cancelSleep() {
+    if (!sleeping && !sleepPhase) return;
+    clearTimeout(sleepTimer);
+    sleeping = false;
+    sleepPhase = '';
+    ping('sleep.cancel', 'interrupted');
+    paintBadge();
+  }
+
+  /** 睡到明天早上 7 点（自动入睡时用），手动睡只睡一小会儿 */
+  function msUntilHour(hour) {
+    const now = new Date();
+    const t = new Date(now);
+    t.setHours(hour, 0, 0, 0);
+    if (t <= now) t.setDate(t.getDate() + 1);
+    return t.getTime() - now.getTime();
+  }
+
+  /**
+   * 开始睡觉。auto=true 是夜里自动睡，睡到早上 7 点；
+   * 手动睡只睡 SLEEP.maxMs（45 秒），免得手动点一下就睡死过去。
+   */
+  async function startSleep(auto = false) {
+    if (sleeping) return false;
+    if (!animTable) return false;
+    if (walking) stopWalk();
+    sleeping = true;
+    sleepPhase = 'start';
+    clearTimeout(sleepTimer);
+    ping('sleep.start', auto ? 'auto' : 'manual');
+    if (auto) say('困了，先眯一会儿…', 4000);
+    const ok = await playAnim(SLEEP.start, false, 1, () => sleepLoop());
+    if (!ok) {
+      sleeping = false;
+      sleepPhase = '';
+      return false;
+    }
+    sleepTimer = setTimeout(() => wakeUp(), auto ? msUntilHour(7) : SLEEP.maxMs);
+    paintBadge();
+    return true;
+  }
+
+  /** 入睡段播完 → 进入循环段 */
+  function sleepLoop() {
+    if (!sleeping || sleepPhase !== 'start') return;
+    sleepPhase = 'loop';
+    ping('sleep.loop', SLEEP.loop);
+    playAnim(SLEEP.loop, true);
+  }
+
+  /** 醒来：播起床段，播完回待机 */
+  function wakeUp() {
+    if (!sleeping) return;
+    clearTimeout(sleepTimer);
+    sleepPhase = 'end';
+    lastSleepAt = Date.now();
+    ping('sleep.wake', SLEEP.end);
+    playAnim(SLEEP.end, false, 1, () => {
+      sleeping = false;
+      sleepPhase = '';
+      ping('sleep.done', 'idle');
+      paintBadge();
+    });
+  }
+
+  /** 夜里自动睡：23 点到早上 6 点，闲着没事就睡 */
+  function maybeAutoSleep() {
+    if (sleeping) return;
+    const h = new Date().getHours();
+    if (!(h >= 23 || h < 6)) return;
+    if (dragging || walking || quiet || panelKind || !bubble.hidden || lastWorkStatus === 'running') return;
+    if (Date.now() - lastSleepAt < 30 * 60_000) return;
+    startSleep(true);
+  }
+
+  (function sleepWatcher() {
+    setTimeout(() => {
+      try {
+        maybeAutoSleep();
+      } catch {
+        /* 自动入睡失败也别影响主流程 */
+      }
+      sleepWatcher();
+    }, 60_000);
+  })();
+
   // ---- 交互 -------------------------------------------------------------
   function onTap() {
     menu.hidden = true;
+    // 睡着的时候点一下就是叫醒，别搭话
+    if (sleeping) {
+      wakeUp();
+      return;
+    }
     // 先给一句本地短句，点了立刻有反应（模型要两秒多，等着会以为没点中）
     say(withEmoji(pick(BAND_LINES[bandId()] || BAND_LINES.unknown)));
     playAnim(actionOf(state), false);
@@ -610,6 +722,7 @@
       ['📊 看看心情', () => openPanel('mood')],
       ['💰 看看余额', () => openPanel('usage')],
       ['🎬 换个动作', () => openPanel('actions')],
+      [sleeping ? '☀️ 叫醒它' : '😴 睡一觉', () => (sleeping ? wakeUp() : startSleep())],
       [quiet ? '🔊 多说点' : '🔇 安静点', () => toggleQuiet()],
       null,
       ['✕ 关掉桌面助手', () => closeByUser()],
@@ -741,6 +854,11 @@
       for (const k of keys) {
         const v = animTable && animTable[k];
         if (!v) continue;
+        // 睡觉是一套三段接力，单播一段没有意义，给一个「睡一觉」按钮走完整流程
+        if (k === 'sleep') {
+          names.push(SLEEP.menu);
+          continue;
+        }
         if (Array.isArray(v)) names.push(...v);
         else names.push(v);
       }
@@ -750,8 +868,13 @@
         const btn = el('button', 'act', name);
         btn.type = 'button';
         btn.addEventListener('click', () => {
-          playAnim(name, false);
-          ping('act', name);
+          if (name === SLEEP.menu) {
+            startSleep();
+            ping('act', 'sleep');
+          } else {
+            playAnim(name, false);
+            ping('act', name);
+          }
           closePanel();
         });
         box.appendChild(btn);
@@ -943,6 +1066,11 @@
   // ---- 徽章 / 心情 -------------------------------------------------------
   function paintBadge() {
     const m = state?.mood;
+    if (sleeping) {
+      badge.hidden = false;
+      badge.textContent = '💤 睡觉中';
+      return;
+    }
     if (!m) {
       badge.hidden = true;
       return;
@@ -1154,6 +1282,24 @@
       await new Promise((r2) => setTimeout(r2, waitMs));
       const x1 = Math.round(window.screenX || 0);
       return `x ${x0}→${x1} | moved=${x1 - x0} | started=${started} | walking=${walking} | anim=${lastAnimName}`;
+    },
+
+    /**
+     * 睡觉三段接力自检：睡下去 → 看有没有进循环段 → 叫醒 → 看有没有回待机。
+     */
+    sleepTest: async () => {
+      const phases = [];
+      const started = await startSleep();
+      phases.push('start:' + sleepPhase);
+      await new Promise((r2) => setTimeout(r2, 12000)); // 入睡段 10 秒素材播完
+      phases.push('afterStart:' + sleepPhase);
+      await new Promise((r2) => setTimeout(r2, 1500));
+      phases.push('loop:' + sleepPhase);
+      wakeUp();
+      phases.push('wake:' + sleepPhase);
+      await new Promise((r2) => setTimeout(r2, 11000)); // 起床段 10 秒素材播完
+      phases.push('done:' + sleepPhase);
+      return `started=${started} | ${phases.join(' | ')} | badge=${badge.textContent}`;
     },
 
     open: (kind) => openPanel(kind),
