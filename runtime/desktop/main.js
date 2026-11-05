@@ -144,10 +144,12 @@ function movePetTo(x, y) {
  */
 const HUD_MAX = 600;
 const HUD_MIN = 120;
+/** 真正需要的高度：气泡 176 / 右键菜单 250 / 面板最高 300，留一点余量就够 */
+const HUD_WANT = 320;
 function hudSpace() {
   const area = screen.getPrimaryDisplay().workArea;
-  const base = Math.round((petWidth * 9) / 16) + BADGE_SPACE;
-  return Math.max(HUD_MIN, Math.min(HUD_MAX, area.height - base - 16));
+  // 之前是"屏幕剩多少给多少"（最高 600），窗口一大半是空的，手上没反应也挡桌面
+  return Math.max(HUD_MIN, Math.min(HUD_WANT, Math.round(area.height * 0.42)));
 }
 
 function windowSize(width) {
@@ -306,11 +308,15 @@ function setIgnore(next) {
 function petZone() {
   const w = Math.round(petWidth);
   const h = Math.round((petWidth * 9) / 16);
+  // 视频框比宠物本体大一圈（640×360 里四周是透明的），热区按比例内缩，
+  // 免得光标还离着一段就变成抓手、也免得挡住旁边能点的东西。
+  const insetX = Math.round(w * 0.06);
+  const insetY = Math.round(h * 0.08);
   return {
-    x: Math.round((curBounds.width - w) / 2),
-    y: Math.round(curBounds.height - BADGE_SPACE - h),
-    w,
-    h,
+    x: Math.round((curBounds.width - w) / 2) + insetX,
+    y: Math.round(curBounds.height - BADGE_SPACE - h) + insetY,
+    w: w - insetX * 2,
+    h: h - insetY * 2,
   };
 }
 
@@ -415,8 +421,9 @@ function physTick() {
     phys.vx = -phys.vx * PHYS.WALL_BOUNCE;
   }
 
-  // 地面：窗口底边（宠物脚底）触地
-  const floor = area.y + area.height - b.height;
+  // 左右墙 + 地面，**顶部不设边界**：往上抛就让宠物飞出屏幕上沿，落下来自己再掉回来。
+  // 地面按"宠物脚底"算：窗口底部还留着 BADGE_SPACE 给状态徽章，用窗口底当地面会让宠物悬空一截。
+  const floor = area.y + area.height - (b.height - BADGE_SPACE);
   if (y >= floor) {
     y = floor;
     const impact = Math.abs(phys.vy);

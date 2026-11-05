@@ -10,3 +10,4 @@ tmp-*.mjs
 Thumbs.db
 .DS_Store
 desktop.ini
+tmp/
