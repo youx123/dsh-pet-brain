@@ -105,6 +105,8 @@
     if (!name || name === currentAnim) return null;
     // 播别的动作就等于醒了：睡眠状态要跟着收掉（不然徽章一直挂着睡觉中）
     if (sleeping && !SLEEP_CLIPS.has(name)) cancelSleep();
+    // 同理，追饭的戏被别的动作抢走就散场，不然状态卡住、宠物再也不溜达
+    if (baifanPhase >= 0 && !BAIFAN.includes(name)) cancelBaifan();
     const token = ++animToken;
     currentAnim = name;
     try {
@@ -496,9 +498,11 @@
   window.petDesk.onWalkEnd?.((info) => {
     walking = false;
     setFlip(false);
-    playAnim(IDLE_ANIM, true);
     lastWalkAt = Date.now();
     ping('walk.end', String(info?.reason ?? ''));
+    // 追饭第一段走完了，接着演后面四段
+    if (baifanPhase === 0) baifanNext();
+    else playAnim(IDLE_ANIM, true);
   });
 
   /** 走动条件：别在忙、别在说话、别拖着的时候满地跑 */
@@ -512,6 +516,7 @@
       lastWorkStatus !== 'running' &&
       !walking &&
       !sleeping &&
+      baifanPhase < 0 &&
       Date.now() - lastWalkAt > 25_000
     );
   }
@@ -661,6 +666,60 @@
     }, 60_000);
   })();
 
+  // ---- 追饭（照抄上游 dsh-pet 的 baifan 五连）--------------------------
+  // 上游 assets/config.jsonc 里 "baifan": ["开心小跑","侧身急躁跑","期待开饭","吃饭·碗饭","吃饭团"]
+  // 依次是：跑向饭 / 追饭时的侧身跑 / 到位后等开饭 / 吃到碗饭 / 吃饭团。
+  // 第一段用走位系统（窗口真的会跑），后面四段原地演，演完接下一段。
+  const BAIFAN = ['开心小跑', '侧身急躁跑', '期待开饭', '吃饭·碗饭', '吃饭团'];
+  let baifanPhase = -1;
+
+  function cancelBaifan(reason = 'interrupted') {
+    if (baifanPhase < 0) return;
+    baifanPhase = -1;
+    ping('baifan.cancel', reason);
+  }
+
+  /** 开始追饭：先跑过去 */
+  async function startBaifan() {
+    if (baifanPhase >= 0) return false;
+    // 「安静点」只是别话多，不该连吃饭都不让 —— 所以这里不看 quiet
+    if (sleeping || walking || dragging || panelKind) {
+      ping('baifan.blocked', `sleeping=${sleeping} walking=${walking} dragging=${!!dragging} panel=${panelKind}`);
+      return false;
+    }
+    baifanPhase = 0;
+    const dx = Math.round((140 + Math.random() * 240) * (Math.random() < 0.5 ? -1 : 1));
+    ping('baifan.start', 'dx=' + dx);
+    const ok = await startWalkRun(dx, BAIFAN[0]);
+    if (!ok) baifanPhase = -1;
+    return ok;
+  }
+
+  /** 上一段演完，接下一段 */
+  function baifanNext() {
+    if (baifanPhase < 0) return;
+    baifanPhase += 1;
+    if (baifanPhase >= BAIFAN.length) {
+      baifanDone();
+      return;
+    }
+    const name = BAIFAN[baifanPhase];
+    ping('baifan.step', `${baifanPhase}:${name}`);
+    playAnim(name, false, 1, () => baifanNext());
+  }
+
+  /** 吃完了：本地先报一声，再让共享大脑按它的调子补一句 */
+  function baifanDone() {
+    baifanPhase = -1;
+    ping('baifan.done', 'ate');
+    say('呼——吃饱啦～');
+    askHostSpeak(true).then((res) => {
+      if (!res?.text) return;
+      say(res.text, 9000, res.emoji || '');
+      ping('baifan.speak', res.text.slice(0, 30));
+    });
+  }
+
   // ---- 交互 -------------------------------------------------------------
   function onTap() {
     menu.hidden = true;
@@ -722,6 +781,7 @@
       ['📊 看看心情', () => openPanel('mood')],
       ['💰 看看余额', () => openPanel('usage')],
       ['🎬 换个动作', () => openPanel('actions')],
+      ['🍚 去吃饭', () => startBaifan()],
       [sleeping ? '☀️ 叫醒它' : '😴 睡一觉', () => (sleeping ? wakeUp() : startSleep())],
       [quiet ? '🔊 多说点' : '🔇 安静点', () => toggleQuiet()],
       null,
@@ -1098,20 +1158,26 @@
 
       // 工作状态：老大在忙就安静干活，干完了冒一句
       const w = state?.work;
+      const busyScene = sleeping || baifanPhase >= 0; // 睡觉/追饭时不插播工作动作
       if (w && w.status !== lastWorkStatus) {
         if (w.status === 'running' && w.action) {
-          playAnim(w.action, true);
-          ping('work.running', w.action);
+          if (!busyScene) {
+            playAnim(w.action, true);
+            ping('work.running', w.action);
+          }
         } else if (lastWorkStatus === 'running') {
-          playAnim('待机呼吸休闲', true);
-          ping('work.idle', 'turns=' + (w.turns ?? 0));
+          if (!busyScene) {
+            playAnim('待机呼吸休闲', true);
+            ping('work.idle', 'turns=' + (w.turns ?? 0));
+          }
           if (!quiet && !panelKind && bubble.hidden) say('这轮干完啦，歇会儿？');
         }
         lastWorkStatus = w.status;
       }
       // 情绪动作：闲时才换，而且别换太勤（每 2 秒轮询一次，换太勤看着抽搐）
       // 老大在忙的时候不插播情绪动作 —— 专心干活，别打扰。
-      if (!dragging && lastWorkStatus !== 'running' && state?.actions?.length) {
+      // 睡觉 / 追饭的时候也别插播 —— 那会把正在进行的一整套动作打断。
+      if (!dragging && !sleeping && baifanPhase < 0 && lastWorkStatus !== 'running' && state?.actions?.length) {
         const now = Date.now();
         if (now - lastActionSwap > 14000) {
           lastActionSwap = now;
@@ -1300,6 +1366,21 @@
       await new Promise((r2) => setTimeout(r2, 11000)); // 起床段 10 秒素材播完
       phases.push('done:' + sleepPhase);
       return `started=${started} | ${phases.join(' | ')} | badge=${badge.textContent}`;
+    },
+
+    /**
+     * 追饭五连自检：跑 → 追 → 等开饭 → 吃碗饭 → 吃饭团。
+     */
+    baifanTest: async () => {
+      const steps = [];
+      const ok = await startBaifan();
+      steps.push('p' + baifanPhase);
+      for (let i = 0; i < 13; i++) {
+        await new Promise((r2) => setTimeout(r2, 3000));
+        steps.push('p' + baifanPhase + ':' + lastAnimName);
+        if (baifanPhase < 0) break;
+      }
+      return `started=${ok} | ${steps.join(' | ')}`;
     },
 
     open: (kind) => openPanel(kind),

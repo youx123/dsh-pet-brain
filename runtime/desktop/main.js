@@ -291,6 +291,19 @@ function createWindow() {
             }
             const report = await p;
             log('sleep ' + report);
+          } else if (auto === 'baifan') {
+            // 追饭五连：跑 → 追 → 等开饭 → 吃碗饭 → 吃饭团
+            const p = win.webContents.executeJavaScript('window.__petDeskTest.baifanTest()');
+            // 走到一半抓一张，确认真的在跑
+            await new Promise((r) => setTimeout(r, 4000));
+            try {
+              const shot = await win.webContents.capturePage();
+              fs.writeFileSync(path.join(require('node:os').tmpdir(), 'dsh-pet-brain-baifan-shot.png'), shot.toPNG());
+            } catch {
+              /* 抓不到就算了 */
+            }
+            const report = await p;
+            log('baifan ' + report);
           } else if (auto === 'menu') {
             // 派发一次右键，验证菜单样式
             await win.webContents.executeJavaScript(
