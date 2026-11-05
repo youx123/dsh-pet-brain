@@ -29,6 +29,19 @@ contextBridge.exposeInMainWorld('petDesk', {
   walk: (x, speed = 80) => ipcRenderer.send('pet:walk', { x, speed }),
   /** 相对走动：dx 是"往右走多少像素"，渲染端不知道窗口坐标，用这个 */
   walkBy: (dx, speed = 80) => ipcRenderer.send('pet:walk', { dx, speed }),
+  /**
+   * 上游式走位（对齐 dsh-pet 的 motion/walk.ts）：
+   * 渲染端先播走位动画，再把「相对位移 + 素材时长 + 起收脚秒数」交给主进程，
+   * 主进程按动画播放时间线性插值窗口位置 —— 脚不打滑，起步收步也自然。
+   */
+  walkBegin: (info) =>
+    ipcRenderer.send('pet:walk-begin', {
+      dx: Number(info?.dx) || 0,
+      duration: Number(info?.duration) || 0,
+      leadSec: Number(info?.leadSec) || 0,
+      tailSec: Number(info?.tailSec) || 0,
+      rate: Number(info?.rate) || 1,
+    }),
   stopWalk: () => ipcRenderer.send('pet:walk', { stop: true }),
   /** 保留兼容：渲染端启动时会上报一次宽度。窗口尺寸已固定，主进程收到同值会直接忽略 */
   resize: (width) => ipcRenderer.send('pet:resize', width),

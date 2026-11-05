@@ -96,8 +96,13 @@
     });
   }
 
-  async function playAnim(name, loop = true) {
-    if (!name || name === currentAnim) return;
+  /**
+   * 播一个动作。返回正在播的那块 <video>（拿它的 duration 用来算走位曲线），
+   * 没播成返回 null。
+   * rate 是播放倍速：素材统一 10 秒，走位时压到 1.5 倍，走起来不拖沓。
+   */
+  async function playAnim(name, loop = true, rate = 1) {
+    if (!name || name === currentAnim) return null;
     const token = ++animToken;
     currentAnim = name;
     try {
@@ -111,6 +116,7 @@
       if (token !== animToken) return; // 已经切到别的动作了，这次作废
       const back = vids[1 - front];
       back.loop = loop;
+      back.playbackRate = rate;
       back.src = url;
       back.load();
       await waitPlayable(back);
@@ -124,10 +130,12 @@
       lastAnimName = name;
       // 第一个有画面的动作到位后就量一次轮廓（待机最好，但别的动作也是同一只宠物）
       setTimeout(probeContentBox, 350);
+      return back;
     } catch (e) {
       // 素材缺失就退回待机，不要把窗口搞成空白
       ping('anim.fail', String(e?.message || e));
       if (name !== '待机呼吸休闲') playAnim('待机呼吸休闲', true);
+      return null;
     }
   }
 
@@ -439,10 +447,21 @@
 
   // ---- 走动 -------------------------------------------------------------
   /**
-   * 素材里全是原地动作，真正"从这儿走到那儿"要靠主进程挪窗口。
-   * 这里只做三件事：播走路动画、按方向镜像、走完收回来。
+   * 素材里全是原地动作（上游的提示词还写死了「全程不许产生 X 轴位移」），
+   * 真正"从这儿走到那儿"只能靠代码平移窗口。
+   *
+   * 做法照抄上游 dsh-pet 的 `src/client/pet/motion/walk.ts`：
+   *   起手 leadSec 秒原地不动 → 中段按「动画播放时间」线性插值位移
+   *   → 收脚 tailSec 秒到位站定。
+   * 关键是位移曲线跟着动画走而不是匀速 —— 脚不打滑，起身收步也自然。
    */
-  const WALK_ANIMS = ['螃蟹走路', '原地漂浮踏步', '原地左转奔跑'];
+  const WALK_ANIMS = ['开心小跑', '螃蟹走路', '原地漂浮踏步'];
+  /** 走位参数（对齐上游 moves.default 的 leadSec / tailSec 思路） */
+  const WALK_PLAY = {
+    leadSec: 1.0, // 起手原地蓄力（媒体秒）
+    tailSec: 1.6, // 收脚站定（媒体秒）
+    rate: 1.5, // 播放倍速：素材统一 10 秒，压到 ~6.7 秒走完
+  };
   let walking = false;
   /** 当前在播的动画名（探针用） */
   let lastAnimName = '';
@@ -462,9 +481,9 @@
   }
 
   window.petDesk.onWalkStart?.((info) => {
+    // 兼容旧路径（主进程直接发起位移）。动画由渲染端自己播，这里只管朝向。
     walking = true;
-    setFlip(Number(info?.dir) < 0);
-    playAnim(pick(WALK_ANIMS), true);
+    setFlip(Number(info?.dir) > 0);
     ping('walk.start', 'dir=' + (info?.dir ?? 1));
   });
 
@@ -490,16 +509,41 @@
     );
   }
 
-  /** 随机溜达一段：心情越好走得越远越快，低落时就近挪两步 */
+  /**
+   * 真正走一步：播走位动画 → 拿到素材时长 → 交给主进程按播放时间插值位移。
+   * dx 是相对位移（渲染端不知道窗口坐标，只有主进程能改窗口）。
+   */
+  async function startWalkRun(dx, name) {
+    walking = true;
+    // 素材的滑步动势是朝左的（上游提示词原文："向左侧横向移动的滑步动势"），
+    // 所以往右走时镜像一次，脚步方向和位移方向才一致。
+    setFlip(dx > 0);
+    const v = await playAnim(name, false, WALK_PLAY.rate);
+    if (!v) {
+      walking = false;
+      setFlip(false);
+      return false;
+    }
+    const duration = Number.isFinite(v.duration) && v.duration > 0 ? v.duration : 10.04;
+    window.petDesk.walkBegin?.({
+      dx: Math.round(dx),
+      duration,
+      leadSec: WALK_PLAY.leadSec,
+      tailSec: WALK_PLAY.tailSec,
+      rate: WALK_PLAY.rate,
+    });
+    ping('walk.go', `dx=${Math.round(dx)} anim=${name} dur=${duration.toFixed(2)}`);
+    return true;
+  }
+
+  /** 随机溜达一段：心情越好走得越远，低落时就近挪两步 */
   function maybeWander() {
     if (!canWander()) return;
     const moodNow = Number(state?.mood?.mood ?? 60);
-    const reach = moodNow >= 72 ? 420 : moodNow >= 55 ? 280 : 150;
-    const delta = (Math.random() < 0.5 ? -1 : 1) * (90 + Math.random() * reach);
-    const speed = moodNow >= 72 ? 110 : moodNow >= 55 ? 90 : 65;
-    // 传相对位移：主进程才知道窗口现在在哪，也只有它能改
-    window.petDesk.walkBy?.(Math.round(delta), speed);
-    ping('walk.go', `dx=${Math.round(delta)}`);
+    // 距离按上游 moves 的量级来（60~320px），再远就像瞬移了
+    const reach = moodNow >= 72 ? 240 : moodNow >= 55 ? 160 : 90;
+    const dx = (70 + Math.random() * reach) * (Math.random() < 0.5 ? -1 : 1);
+    startWalkRun(dx, pick(WALK_ANIMS));
   }
 
   (function wanderLoop() {
@@ -665,7 +709,9 @@
    */
   const ACTION_GROUPS = [
     ['日常', ['idle', 'small']],
+    ['走路', ['walk']],
     ['吃喝', ['eat']],
+    ['睡觉', ['sleep']],
     ['互动', ['click']],
     ['特别', ['whale', 'gift', 'surprise']],
   ];
@@ -1098,12 +1144,14 @@
     /**
      * 走动自检：让人走一段，采样窗口 x 看真的挪了没有、走完动画有没有收回 idle。
      */
-    walkTest: async (dx = 300) => {
+    walkTest: async (dx = -300) => {
       const x0 = Math.round(window.screenX || 0);
-      window.petDesk.walkBy?.(dx, 110);
-      await new Promise((r2) => setTimeout(r2, 200));
+      await startWalkRun(dx, WALK_ANIMS[0]);
+      await new Promise((r2) => setTimeout(r2, 300));
       const started = walking;
-      await new Promise((r2) => setTimeout(r2, 4200));
+      // 走位全长 = 素材时长 / 倍速，等它走完再采样
+      const waitMs = Math.round((10.04 / WALK_PLAY.rate) * 1000) + 900;
+      await new Promise((r2) => setTimeout(r2, waitMs));
       const x1 = Math.round(window.screenX || 0);
       return `x ${x0}→${x1} | moved=${x1 - x0} | started=${started} | walking=${walking} | anim=${lastAnimName}`;
     },

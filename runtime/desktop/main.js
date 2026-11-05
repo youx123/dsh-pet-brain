@@ -256,7 +256,8 @@ function createWindow() {
             const p = win.webContents.executeJavaScript('window.__petDeskTest.walkTest(-320)');
             let minX = Infinity;
             let maxX = -Infinity;
-            for (let i = 0; i < 18; i++) {
+            // 走位全程 = 素材 10.04s ÷ 1.5 倍速 ≈ 6.7s，采样要盖住整段
+            for (let i = 0; i < 56; i++) {
               await new Promise((r) => setTimeout(r, 150));
               if (!win || win.isDestroyed()) break;
               const b = win.getBounds();
@@ -517,17 +518,35 @@ function startPhysics() {
 /**
  * 走动：窗口自己在屏幕上平移。
  *
- * 素材里没有"从 A 走到 B"的动画（moves.actions 那几个全是原地动作），
- * 所以位移只能由主进程做 —— 渲染端播「螃蟹走路」，主进程把窗口平滑挪过去，
- * 两边凑起来才像真的在走。速度给个范围，太快像瞬移、太慢像卡住。
+ * 素材里没有"从 A 走到 B"的动画（上游的提示词还写死了「全程不许产生 X 轴位移」），
+ * 所以位移只能由主进程做 —— 渲染端播一段原地走路动画，主进程把窗口挪过去。
+ *
+ * 位移曲线照抄上游 dsh-pet 的 `src/client/pet/motion/walk.ts`：
+ *   起手 leadSec 秒原地不动 → 中段按「动画播放时间」线性插值 → 收脚 tailSec 秒站定。
+ * 跟着动画时间走而不是匀速，脚不会打滑，起身和收步也自然。
  */
 const WALK = {
-  minSpeed: 50, // px/s
+  minSpeed: 50, // px/s（旧的匀速路径还在用）
   maxSpeed: 130,
   tickMs: 16,
+  /** 起手 / 收脚各多少媒体秒原地不动（对齐上游 moves.default） */
+  leadSec: 1.0,
+  tailSec: 1.6,
 };
 
-const walk = { mode: 'idle', targetX: 0, speed: 0, timer: null, dir: 1 };
+const walk = {
+  mode: 'idle',
+  startX: 0,
+  targetX: 0,
+  t0: 0,
+  duration: 0,
+  leadSec: WALK.leadSec,
+  tailSec: WALK.tailSec,
+  rate: 1,
+  speed: 0,
+  timer: null,
+  dir: 1,
+};
 
 function stopWalk(reason = '') {
   if (walk.timer) {
@@ -551,31 +570,56 @@ function walkTick() {
   const minX = area.x;
   const maxX = area.x + area.width - b.width;
   const target = Math.min(Math.max(walk.targetX, minX), maxX);
-  const dx = target - b.x;
 
-  // 一步走一小截，够近了就吸附上去 —— 免得在目标点附近来回抖
-  const step = Math.max(1, (walk.speed * WALK.tickMs) / 1000);
-  if (Math.abs(dx) <= step) {
+  // 走了多少（媒体时间，素材按 rate 倍速播放）
+  const elapsed = (Date.now() - walk.t0) / 1000;
+  const media = elapsed * walk.rate;
+  const travel = Math.max(0.1, walk.duration - walk.leadSec - walk.tailSec);
+  let ratio;
+  if (media <= walk.leadSec) ratio = 0;
+  else if (media >= walk.duration - walk.tailSec) ratio = 1;
+  else ratio = (media - walk.leadSec) / travel;
+
+  const wantX = Math.round(walk.startX + (target - walk.startX) * ratio);
+  if (wantX !== b.x) movePetTo(wantX, b.y);
+
+  if (media >= walk.duration) {
     movePetTo(target, b.y);
     stopWalk(target === walk.targetX ? 'arrived' : 'hit-edge');
-    return;
   }
-  movePetTo(b.x + Math.sign(dx) * step, b.y);
 }
 
-function startWalk(targetX, speed = 80) {
+function startWalk(targetX, speed = 80, opts = {}) {
   if (!win || win.isDestroyed()) return;
   const target = Number(targetX);
   if (!Number.isFinite(target)) return;
   stopPhysics();
   const b = win.getBounds();
+  walk.startX = b.x;
   walk.targetX = Math.round(target);
   walk.speed = Math.min(Math.max(Number(speed) || 80, WALK.minSpeed), WALK.maxSpeed);
   walk.dir = walk.targetX >= b.x ? 1 : -1;
+  walk.duration = Number(opts.duration) > 0 ? Number(opts.duration) : 10.04;
+  walk.leadSec = Number.isFinite(Number(opts.leadSec)) ? Number(opts.leadSec) : WALK.leadSec;
+  walk.tailSec = Number.isFinite(Number(opts.tailSec)) ? Number(opts.tailSec) : WALK.tailSec;
+  walk.rate = Number(opts.rate) > 0 ? Number(opts.rate) : 1;
+  walk.t0 = Date.now();
   walk.mode = 'walk';
   if (!walk.timer) walk.timer = setInterval(walkTick, WALK.tickMs);
   win.webContents.send('pet:walk-start', { dir: walk.dir });
 }
+
+/**
+ * 渲染端发起走位：它已经播上了动画，把时长和起收脚秒数一起报过来，
+ * 主进程按播放时间插值把窗口挪过去。
+ */
+ipcMain.on('pet:walk-begin', (_e, msg) => {
+  if (!win || win.isDestroyed() || !msg) return;
+  const dx = Number(msg.dx);
+  if (!Number.isFinite(dx) || Math.abs(dx) < 4) return;
+  const b = win.getBounds();
+  startWalk(b.x + dx, 0, msg);
+});
 
 ipcMain.on('pet:walk', (_e, msg) => {
   if (!msg) return;
