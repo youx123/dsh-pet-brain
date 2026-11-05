@@ -20,6 +20,19 @@
 
 两者可以同时装，但都挂 `shell.overlay`，会叠在一起——建议只留一个。
 
+## 怎么装
+
+前置：profile 里得先有 [`dsh-shared-brain`](https://github.com/youx123/dsh-shared-brain) —— 人设、心情、记忆全从它那儿读，没有它这只桌宠就只剩个空壳。
+
+```bash
+git clone https://github.com/youx123/dsh-pet-brain.git
+dsh plugin add <克隆下来的目录绝对路径>
+```
+
+也可以直接下 Release 里的 `dsh-pet-brain-0.1.0.tgz`，解压后 `dsh plugin add <解压出来的目录>`。
+
+装完**完全退出客户端再启动一次** —— 客户端只认启动时那一次 bundle，不重启看不到桌宠。
+
 ## 装在哪
 
 - 源码：`C:\Users\13176\Documents\dsh-pet-brain`
