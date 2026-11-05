@@ -67,6 +67,14 @@ show('✓ 路径穿越被拒', travRes);
 const missRes = await get('/pet-brain/nope');
 show('✓ 未知路径', missRes);
 
+// 主动互动：决策要能读到共享大脑主会话的脉搏（host.sinceMs 是距主会话上次开口的毫秒数）
+const proRes = await get('/pet-brain/proactive');
+show('✓ /proactive', proRes);
+const pro = await proRes.json();
+console.log('   action =', pro.action, ' reason =', pro.reason, ' followHost =', pro.followHost, ' retryMs =', pro.retryMs);
+console.log('   host =', JSON.stringify(pro.host));
+console.log('   pacing =', JSON.stringify({ quiet: pro.config?.mood?.quietPeriodMs, maxPerDay: pro.config?.mood?.maxPerDay }));
+
 const postRes = await fetch(base + '/pet-brain/chat', {
   method: 'POST',
   headers: { 'content-type': 'application/json' },

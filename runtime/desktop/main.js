@@ -249,6 +249,22 @@ function createWindow() {
           } else if (auto === 'speak') {
             const report = await win.webContents.executeJavaScript('window.__petDeskTest.speak(true)');
             log('speak ' + report);
+          } else if (auto === 'walk') {
+            // 一边走一边采样窗口 x，确认真的在平移而不是只播了个原地动画
+            // 往左走：桌宠本来就贴着右下角，往右只有二十来像素空间，看不出效果
+            const startX = win.getBounds().x;
+            const p = win.webContents.executeJavaScript('window.__petDeskTest.walkTest(-320)');
+            let minX = Infinity;
+            let maxX = -Infinity;
+            for (let i = 0; i < 18; i++) {
+              await new Promise((r) => setTimeout(r, 150));
+              if (!win || win.isDestroyed()) break;
+              const b = win.getBounds();
+              minX = Math.min(minX, b.x);
+              maxX = Math.max(maxX, b.x);
+            }
+            const report = await p;
+            log(`walk startX=${startX} minX=${minX} maxX=${maxX} span=${maxX - minX} | ${report}`);
           } else if (auto === 'probe') {
             const report = await win.webContents.executeJavaScript('window.__petDeskTest.probe()');
             log('probe ' + report);
@@ -493,14 +509,93 @@ function physTick() {
 
 function startPhysics() {
   if (phys.timer) return;
+  stopWalk('throw');
   phys.last = Date.now();
   phys.timer = setInterval(physTick, 16);
 }
+
+/**
+ * 走动：窗口自己在屏幕上平移。
+ *
+ * 素材里没有"从 A 走到 B"的动画（moves.actions 那几个全是原地动作），
+ * 所以位移只能由主进程做 —— 渲染端播「螃蟹走路」，主进程把窗口平滑挪过去，
+ * 两边凑起来才像真的在走。速度给个范围，太快像瞬移、太慢像卡住。
+ */
+const WALK = {
+  minSpeed: 50, // px/s
+  maxSpeed: 130,
+  tickMs: 16,
+};
+
+const walk = { mode: 'idle', targetX: 0, speed: 0, timer: null, dir: 1 };
+
+function stopWalk(reason = '') {
+  if (walk.timer) {
+    clearInterval(walk.timer);
+    walk.timer = null;
+  }
+  const was = walk.mode;
+  walk.mode = 'idle';
+  if (was === 'walk' && reason && win && !win.isDestroyed()) {
+    win.webContents.send('pet:walk-end', { reason });
+  }
+}
+
+function walkTick() {
+  if (!win || win.isDestroyed() || walk.mode !== 'walk') {
+    stopWalk();
+    return;
+  }
+  const b = win.getBounds();
+  const area = screen.getPrimaryDisplay().workArea;
+  const minX = area.x;
+  const maxX = area.x + area.width - b.width;
+  const target = Math.min(Math.max(walk.targetX, minX), maxX);
+  const dx = target - b.x;
+
+  // 一步走一小截，够近了就吸附上去 —— 免得在目标点附近来回抖
+  const step = Math.max(1, (walk.speed * WALK.tickMs) / 1000);
+  if (Math.abs(dx) <= step) {
+    movePetTo(target, b.y);
+    stopWalk(target === walk.targetX ? 'arrived' : 'hit-edge');
+    return;
+  }
+  movePetTo(b.x + Math.sign(dx) * step, b.y);
+}
+
+function startWalk(targetX, speed = 80) {
+  if (!win || win.isDestroyed()) return;
+  const target = Number(targetX);
+  if (!Number.isFinite(target)) return;
+  stopPhysics();
+  const b = win.getBounds();
+  walk.targetX = Math.round(target);
+  walk.speed = Math.min(Math.max(Number(speed) || 80, WALK.minSpeed), WALK.maxSpeed);
+  walk.dir = walk.targetX >= b.x ? 1 : -1;
+  walk.mode = 'walk';
+  if (!walk.timer) walk.timer = setInterval(walkTick, WALK.tickMs);
+  win.webContents.send('pet:walk-start', { dir: walk.dir });
+}
+
+ipcMain.on('pet:walk', (_e, msg) => {
+  if (!msg) return;
+  if (msg.stop) {
+    stopWalk('cancel');
+    return;
+  }
+  // dx = 相对当前位置走多远（渲染端不知道窗口坐标，所以走这条）
+  if (Number.isFinite(Number(msg.dx)) && win && !win.isDestroyed()) {
+    startWalk(win.getBounds().x + Number(msg.dx), msg.speed);
+    return;
+  }
+  startWalk(msg.x, msg.speed);
+});
 
 ipcMain.on('pet:drag', (_e, msg) => {
   if (!win || win.isDestroyed() || !msg) return;
   if (msg.phase === 'start') {
     stopPhysics();
+    stopWalk('drag');
     const [wx, wy] = win.getPosition();
     dragOffset = { dx: msg.screenX - wx, dy: msg.screenY - wy };
     return;

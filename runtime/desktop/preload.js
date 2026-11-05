@@ -25,10 +25,19 @@ contextBridge.exposeInMainWorld('petDesk', {
     ipcRenderer.send('pet:drag', { phase, screenX, screenY, vx, vy }),
   /** 气泡/菜单/面板出现时把窗口往上长（底边不动），收起来传 0 */
   grow: (extra) => ipcRenderer.send('pet:grow', extra),
+  /** 走动：把窗口平滑挪到屏幕 x（主进程限速 + 限边界）；stop 用于打断 */
+  walk: (x, speed = 80) => ipcRenderer.send('pet:walk', { x, speed }),
+  /** 相对走动：dx 是"往右走多少像素"，渲染端不知道窗口坐标，用这个 */
+  walkBy: (dx, speed = 80) => ipcRenderer.send('pet:walk', { dx, speed }),
+  stopWalk: () => ipcRenderer.send('pet:walk', { stop: true }),
   /** 保留兼容：渲染端启动时会上报一次宽度。窗口尺寸已固定，主进程收到同值会直接忽略 */
   resize: (width) => ipcRenderer.send('pet:resize', width),
   quit: () => ipcRenderer.send('pet:quit'),
   env: () => ipcRenderer.invoke('pet:env'),
   /** 落地回调：主进程物理算出撞击强度时通知渲染端做压扁动画 */
   onLand: (cb) => ipcRenderer.on('pet:land', (_e, info) => cb(info)),
+  /** 开始走动：dir=1 向右、-1 向左，渲染端据此决定播走路动画和要不要镜像 */
+  onWalkStart: (cb) => ipcRenderer.on('pet:walk-start', (_e, info) => cb(info)),
+  /** 走完 / 被打断 */
+  onWalkEnd: (cb) => ipcRenderer.on('pet:walk-end', (_e, info) => cb(info)),
 });

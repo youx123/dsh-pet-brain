@@ -121,6 +121,7 @@
       vids[front].classList.remove('show');
       front = 1 - front;
       ping('anim.ok', name);
+      lastAnimName = name;
       // 第一个有画面的动作到位后就量一次轮廓（待机最好，但别的动作也是同一只宠物）
       setTimeout(probeContentBox, 350);
     } catch (e) {
@@ -232,6 +233,8 @@
       ping('say.suppressed', String(text).slice(0, 20));
       return;
     }
+    // 说话前先站住：一边走一边冒泡，气泡跟着窗口飘，看着乱
+    if (walking) stopWalk();
     bubble.textContent = '';
     if (emojiKey) {
       const img = document.createElement('img');
@@ -433,6 +436,79 @@
     pet.classList.add('squash');
     ping('land', 'impact=' + (info?.impact ?? 0));
   });
+
+  // ---- 走动 -------------------------------------------------------------
+  /**
+   * 素材里全是原地动作，真正"从这儿走到那儿"要靠主进程挪窗口。
+   * 这里只做三件事：播走路动画、按方向镜像、走完收回来。
+   */
+  const WALK_ANIMS = ['螃蟹走路', '原地漂浮踏步', '原地左转奔跑'];
+  let walking = false;
+  /** 当前在播的动画名（探针用） */
+  let lastAnimName = '';
+  /** 上次走动结束的时间，用来拉开间隔，别一直在地上爬 */
+  let lastWalkAt = 0;
+
+  function setFlip(on) {
+    for (const v of vids) if (v) v.classList.toggle('flip', Boolean(on));
+  }
+
+  function stopWalk() {
+    if (!walking) return;
+    walking = false;
+    setFlip(false);
+    window.petDesk.stopWalk?.();
+    playAnim(IDLE_ANIM, true);
+  }
+
+  window.petDesk.onWalkStart?.((info) => {
+    walking = true;
+    setFlip(Number(info?.dir) < 0);
+    playAnim(pick(WALK_ANIMS), true);
+    ping('walk.start', 'dir=' + (info?.dir ?? 1));
+  });
+
+  window.petDesk.onWalkEnd?.((info) => {
+    walking = false;
+    setFlip(false);
+    playAnim(IDLE_ANIM, true);
+    lastWalkAt = Date.now();
+    ping('walk.end', String(info?.reason ?? ''));
+  });
+
+  /** 走动条件：别在忙、别在说话、别拖着的时候满地跑 */
+  function canWander() {
+    return (
+      !dragging &&
+      !quiet &&
+      !panelKind &&
+      bubble.hidden &&
+      menu.hidden &&
+      lastWorkStatus !== 'running' &&
+      !walking &&
+      Date.now() - lastWalkAt > 25_000
+    );
+  }
+
+  /** 随机溜达一段：心情越好走得越远越快，低落时就近挪两步 */
+  function maybeWander() {
+    if (!canWander()) return;
+    const moodNow = Number(state?.mood?.mood ?? 60);
+    const reach = moodNow >= 72 ? 420 : moodNow >= 55 ? 280 : 150;
+    const delta = (Math.random() < 0.5 ? -1 : 1) * (90 + Math.random() * reach);
+    const speed = moodNow >= 72 ? 110 : moodNow >= 55 ? 90 : 65;
+    // 传相对位移：主进程才知道窗口现在在哪，也只有它能改
+    window.petDesk.walkBy?.(Math.round(delta), speed);
+    ping('walk.go', `dx=${Math.round(delta)}`);
+  }
+
+  (function wanderLoop() {
+    setTimeout(() => {
+      // 不是每次都走，有一半概率原地待着 —— 太勤快反而像扫地机器人
+      if (Math.random() < 0.55) maybeWander();
+      wanderLoop();
+    }, 35_000 + Math.random() * 55_000);
+  })();
 
   // ---- 交互 -------------------------------------------------------------
   function onTap() {
@@ -648,6 +724,7 @@
   function openPanel(kind) {
     menu.hidden = true;
     bubble.hidden = true;
+    if (walking) stopWalk();
     panelKind = kind;
     panel.hidden = false;
     panelName.textContent =
@@ -1016,6 +1093,19 @@
       window.petDesk.drag('end', 0, 0, vx, vy);
       await new Promise((r2) => setTimeout(r2, 2400));
       return 'screenY=' + Math.round(window.screenY) + ' | land=' + (lastLand === null ? 'none' : lastLand);
+    },
+
+    /**
+     * 走动自检：让人走一段，采样窗口 x 看真的挪了没有、走完动画有没有收回 idle。
+     */
+    walkTest: async (dx = 300) => {
+      const x0 = Math.round(window.screenX || 0);
+      window.petDesk.walkBy?.(dx, 110);
+      await new Promise((r2) => setTimeout(r2, 200));
+      const started = walking;
+      await new Promise((r2) => setTimeout(r2, 4200));
+      const x1 = Math.round(window.screenX || 0);
+      return `x ${x0}→${x1} | moved=${x1 - x0} | started=${started} | walking=${walking} | anim=${lastAnimName}`;
     },
 
     open: (kind) => openPanel(kind),
