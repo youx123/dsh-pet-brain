@@ -21,6 +21,8 @@
    */
   const vids = [$('videoA'), $('videoB')];
   let front = 0;
+  /** 待机动作名：既是兜底动作，也是"宠物站姿"采样热区的时机 */
+  const IDLE_ANIM = '待机呼吸休闲';
   const badge = $('badge');
   const bubble = $('bubble');
   const menu = $('menu');
@@ -119,6 +121,8 @@
       vids[front].classList.remove('show');
       front = 1 - front;
       ping('anim.ok', name);
+      // 第一个有画面的动作到位后就量一次轮廓（待机最好，但别的动作也是同一只宠物）
+      setTimeout(probeContentBox, 350);
     } catch (e) {
       // 素材缺失就退回待机，不要把窗口搞成空白
       ping('anim.fail', String(e?.message || e));
@@ -133,6 +137,51 @@
     v.addEventListener('error', () => {
       ping('video.err', `code=${v.error?.code} ${v.error?.message || ''}`);
     });
+  }
+
+  // ---- 宠物本体采样 -----------------------------------------------------
+  // 视频是 640×360，宠物四周留着一大圈透明；用固定比例猜热区永远偏大。
+  // 待机动作播到有画面后读一帧 alpha，算出真实轮廓报给主进程，热区就贴在身上了。
+  let boxProbed = false;
+  function probeContentBox() {
+    if (boxProbed) return;
+    const v = vids[front];
+    if (!v || !v.videoWidth || !v.videoHeight) return;
+    try {
+      const c = document.createElement('canvas');
+      c.width = v.videoWidth;
+      c.height = v.videoHeight;
+      const g = c.getContext('2d', { willReadFrequently: true });
+      g.drawImage(v, 0, 0);
+      const { data, width, height } = g.getImageData(0, 0, c.width, c.height);
+      let x0 = width;
+      let y0 = height;
+      let x1 = -1;
+      let y1 = -1;
+      for (let y = 0; y < height; y++) {
+        const row = y * width * 4;
+        for (let x = 0; x < width; x++) {
+          if (data[row + x * 4 + 3] > 10) {
+            if (x < x0) x0 = x;
+            if (x > x1) x1 = x;
+            if (y < y0) y0 = y;
+            if (y > y1) y1 = y;
+          }
+        }
+      }
+      if (x1 < 0) return;
+      boxProbed = true;
+      const box = {
+        left: +(x0 / width).toFixed(4),
+        top: +(y0 / height).toFixed(4),
+        right: +((x1 + 1) / width).toFixed(4),
+        bottom: +((y1 + 1) / height).toFixed(4),
+      };
+      window.petDesk.contentBox?.(box);
+      ping('box', JSON.stringify(box));
+    } catch (e) {
+      ping('box.fail', String(e?.message || e));
+    }
   }
 
   // ---- 说话 -------------------------------------------------------------
@@ -956,6 +1005,17 @@
       window.dispatchEvent(mk('pointerup', cx + 320, cy - 48));
       await new Promise((r2) => setTimeout(r2, 2600));
       return 'land=' + (lastLand === null ? 'none' : lastLand) + ' | squash=' + pet.classList.contains('squash');
+    },
+
+    /**
+     * 直接给定初速度抛一次（不走指针事件），用来验证上下边界。
+     * 抛掷只用 vx/vy，不需要坐标。
+     */
+    throwTo: async (vx = 0, vy = -3000) => {
+      lastLand = null;
+      window.petDesk.drag('end', 0, 0, vx, vy);
+      await new Promise((r2) => setTimeout(r2, 2400));
+      return 'screenY=' + Math.round(window.screenY) + ' | land=' + (lastLand === null ? 'none' : lastLand);
     },
 
     open: (kind) => openPanel(kind),

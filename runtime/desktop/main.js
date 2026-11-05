@@ -232,6 +232,20 @@ function createWindow() {
           if (auto === 'throw') {
             const report = await win.webContents.executeJavaScript('window.__petDeskTest.throwTest()');
             log('throw ' + report);
+          } else if (auto === 'throwup') {
+            // 猛甩一次向上的，边飞边采样，看顶部边界有没有把宠物挡在屏幕内
+            const p = win.webContents.executeJavaScript('window.__petDeskTest.throwTo(0,-3000)');
+            let minY = Infinity;
+            let maxY = -Infinity;
+            for (let i = 0; i < 24; i++) {
+              await new Promise((r) => setTimeout(r, 120));
+              if (!win || win.isDestroyed()) break;
+              const b = win.getBounds();
+              minY = Math.min(minY, b.y);
+              maxY = Math.max(maxY, b.y);
+            }
+            const report = await p;
+            log('throwup minY=' + minY + ' maxY=' + maxY + ' final=' + JSON.stringify(win.getBounds()) + ' ' + report);
           } else if (auto === 'speak') {
             const report = await win.webContents.executeJavaScript('window.__petDeskTest.speak(true)');
             log('speak ' + report);
@@ -305,18 +319,27 @@ function setIgnore(next) {
  * 宠物永远可点这件事不能等渲染端：窗口刚起来时如果全穿透、又还没有浮层，
  * 光标压在宠物身上点不动，看着就是"又坏了"。
  */
+/**
+ * 渲染端采样出来的"宠物本体"包围盒（0..1 比例，相对视频框）。
+ * 视频是 640×360，宠物在画面里四周留着一大圈透明；固定比例内缩永远调不准，
+ * 所以让渲染端读一帧的 alpha 通道，算出真正的轮廓再报上来。
+ */
+let petBox = null;
+
 function petZone() {
   const w = Math.round(petWidth);
   const h = Math.round((petWidth * 9) / 16);
-  // 视频框比宠物本体大一圈（640×360 里四周是透明的），热区按比例内缩，
-  // 免得光标还离着一段就变成抓手、也免得挡住旁边能点的东西。
-  const insetX = Math.round(w * 0.06);
-  const insetY = Math.round(h * 0.08);
+  // 没采样到就退回保守内缩，保证至少点得到
+  const box = petBox || { left: 0.06, top: 0.08, right: 0.94, bottom: 0.92 };
+  const x0 = Math.round(w * box.left);
+  const y0 = Math.round(h * box.top);
+  const x1 = Math.round(w * box.right);
+  const y1 = Math.round(h * box.bottom);
   return {
-    x: Math.round((curBounds.width - w) / 2) + insetX,
-    y: Math.round(curBounds.height - BADGE_SPACE - h) + insetY,
-    w: w - insetX * 2,
-    h: h - insetY * 2,
+    x: Math.round((curBounds.width - w) / 2) + x0,
+    y: Math.round(curBounds.height - BADGE_SPACE - h) + y0,
+    w: Math.max(24, x1 - x0),
+    h: Math.max(24, y1 - y0),
   };
 }
 
@@ -355,6 +378,22 @@ function stopPointerPoll() {
 
 ipcMain.on('pet:hotzones', (_e, list) => {
   overlays = Array.isArray(list) ? list.filter((z) => z && z.w > 0 && z.h > 0) : [];
+});
+
+ipcMain.on('pet:contentbox', (_e, box) => {
+  // 比例得讲道理：宠物本体至少占三成，否则多半是采到了透明帧或半截动作
+  if (!box) return;
+  const { left, top, right, bottom } = box;
+  const ok =
+    [left, top, right, bottom].every((n) => Number.isFinite(n) && n >= 0 && n <= 1) &&
+    right - left >= 0.3 &&
+    bottom - top >= 0.3;
+  if (!ok) {
+    log('contentbox 忽略 ' + JSON.stringify(box));
+    return;
+  }
+  petBox = { left, top, right, bottom };
+  log('contentbox ' + JSON.stringify(petBox) + ' zone=' + JSON.stringify(petZone()));
 });
 
 ipcMain.on('pet:interactive', (_e, next) => {
@@ -421,8 +460,17 @@ function physTick() {
     phys.vx = -phys.vx * PHYS.WALL_BOUNCE;
   }
 
-  // 左右墙 + 地面，**顶部不设边界**：往上抛就让宠物飞出屏幕上沿，落下来自己再掉回来。
-  // 地面按"宠物脚底"算：窗口底部还留着 BADGE_SPACE 给状态徽章，用窗口底当地面会让宠物悬空一截。
+  // 顶部边界按"宠物头顶"算：窗口上方那一大块是 HUD 留白，拿窗口顶当边界的话
+  // 宠物永远够不到屏幕顶；反过来说，只按窗口顶钳制又会让宠物整只飞出屏幕不要紧。
+  const petH = Math.round((petWidth * 9) / 16);
+  const ceil = area.y - (b.height - BADGE_SPACE - petH);
+  if (y < ceil) {
+    y = ceil;
+    phys.vy = Math.abs(phys.vy) * PHYS.WALL_BOUNCE;
+  }
+
+  // 左右墙 + 地面。地面按"宠物脚底"算：窗口底部还留着 BADGE_SPACE 给状态徽章，
+  // 用窗口底当地面会让宠物悬空一截。
   const floor = area.y + area.height - (b.height - BADGE_SPACE);
   if (y >= floor) {
     y = floor;

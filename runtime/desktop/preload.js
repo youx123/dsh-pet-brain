@@ -16,6 +16,8 @@ contextBridge.exposeInMainWorld('petDesk', {
   setInteractive: (next) => ipcRenderer.send('pet:interactive', Boolean(next)),
   /** 上报可见浮层矩形（窗口坐标 DIP）：[{x,y,w,h}]，主进程按它 + 宠物矩形翻穿透 */
   hotzones: (list) => ipcRenderer.send('pet:hotzones', Array.isArray(list) ? list : []),
+  /** 上报宠物本体包围盒（0..1 比例，相对视频框）：{left,top,right,bottom}，主进程据此定热区 */
+  contentBox: (box) => ipcRenderer.send('pet:contentbox', box || null),
   /**
    * 拖拽。phase='end' 时带上 vx/vy（px/s），主进程据此抛掷。
    */
