@@ -263,6 +263,15 @@ function createWindow() {
               const b = win.getBounds();
               minX = Math.min(minX, b.x);
               maxX = Math.max(maxX, b.x);
+              // 走到一半抓一张，确认画面真的在动（不是只有窗口在挪）
+              if (i === 8) {
+                try {
+                  const mid = await win.webContents.capturePage();
+                  fs.writeFileSync(path.join(require('node:os').tmpdir(), 'dsh-pet-brain-walk-shot.png'), mid.toPNG());
+                } catch {
+                  /* 抓不到就算了 */
+                }
+              }
             }
             const report = await p;
             log(`walk startX=${startX} minX=${minX} maxX=${maxX} span=${maxX - minX} | ${report}`);
