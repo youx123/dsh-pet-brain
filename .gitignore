@@ -1,5 +1,6 @@
 node_modules/
 *.log
+*.tgz
 
 # 调试产物（不进仓库）
 debug-client-graph.json
