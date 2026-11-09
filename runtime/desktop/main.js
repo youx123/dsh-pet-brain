@@ -39,6 +39,21 @@ const BADGE_SPACE = 26;
 const DEFAULT_PET_W = 462;
 
 /**
+ * 只认本机回环的 origin。
+ *
+ * --host= 是命令行参数，任意进程都能传。
+ * 不校验的话，一个第三方进程可以把 origin 换成自己的地址，
+ * 桌宠就会把老大的点击、对话往那儿送（面板内容也会从那儿加载）。
+ * 只放行 http://127.0.0.1:<端口>。
+ */
+function normalizeHost(raw) {
+  const fallback = 'http://127.0.0.1:3080';
+  if (typeof raw !== 'string' || !raw) return fallback;
+  const s = raw.trim().replace(/\/+$/, '');
+  return /^http:\/\/127\.0\.0\.1:\d{2,5}$/.test(s) ? s : fallback;
+}
+
+/**
  * 宿主 origin，由 lib/desktop.js 通过参数传进来。
  *
  * 用 let 不用 const：DSH 重启后端口会变（每次都是随机端口），插件在启动时
@@ -48,8 +63,36 @@ const DEFAULT_PET_W = 462;
  */
 let HOST_ORIGIN = (() => {
   const arg = process.argv.find((a) => a.startsWith('--host='));
-  return arg ? arg.slice('--host='.length) : 'http://127.0.0.1:3080';
+  return normalizeHost(arg ? arg.slice('--host='.length) : '');
 })();
+
+/**
+ * 宿主令牌：桌面助手是 file:// 页面，对宿主来说属于跨源，
+ * 不带这个头宿主会一律回 403（见 lib/index.js 的 isCrossOrigin）。
+ *
+ * 来源两处，依次兜底：
+ *   1. 宿主 spawn 时传的 --token=（正常路径）
+ *   2. $HOME/.dsh/dsh-pet-brain/token（手动起窗口、排障时用）
+ * 读不到就留空 —— 旧宿主没有这道门，空令牌也能用；新宿主下会 403，
+ * 日志里能直接看出来是"没拿到令牌"。
+ */
+const TOKEN_RE = /^[0-9a-f]{32,128}$/i;
+function readTokenFile() {
+  try {
+    const p = path.join(require('node:os').homedir(), '.dsh', 'dsh-pet-brain', 'token');
+    const v = String(fs.readFileSync(p, 'utf8')).trim();
+    return TOKEN_RE.test(v) ? v : '';
+  } catch {
+    return '';
+  }
+}
+function tokenFromArgv(argv) {
+  const arg = (argv || []).find((a) => a.startsWith('--token='));
+  if (!arg) return '';
+  const v = arg.slice('--token='.length).trim();
+  return TOKEN_RE.test(v) ? v : '';
+}
+let PET_TOKEN = tokenFromArgv(process.argv) || readTokenFile();
 
 /**
  * 独立的 userData 目录：Electron 默认按包名共用一个缓存目录，
@@ -94,8 +137,11 @@ if (!gotLock) {
 app.on('second-instance', (_evt, argv) => {
   if (!win) return;
   const arg = (argv || []).find((a) => a.startsWith('--host='));
-  const next = arg ? arg.slice('--host='.length) : '';
+  const next = arg ? normalizeHost(arg.slice('--host='.length)) : '';
   log('second-instance host=' + (next || '(none)') + ' 现在=' + HOST_ORIGIN);
+  // 令牌也可能换了（极少见：换了 DSH_HOME）—— 有就跟着换，没有就沿用旧的
+  const tok = tokenFromArgv(argv);
+  if (tok) PET_TOKEN = tok;
   if (next && next !== HOST_ORIGIN) {
     HOST_ORIGIN = next;
     win.loadFile(path.join(__dirname, 'index.html'), { query: { host: HOST_ORIGIN } });
@@ -120,8 +166,17 @@ app.on('second-instance', (_evt, argv) => {
 
 let win = null;
 let petWidth = DEFAULT_PET_W;
-/** 当前是否整窗点击穿透（渲染端按光标是否压在宠物身上翻转） */
-let ignoring = true;
+/**
+ * 当前是否整窗点击穿透（渲染端按光标是否压在宠物身上翻转）。
+ *
+ * 初值必须是 null 而不是 true：
+ * Electron 新建 BrowserWindow 默认**不**忽略鼠标事件，
+ * 而 setIgnore() 里 `if (ignoring === next) return;` 会把初值 true 的那次调用直接吞掉 ——
+ * 结果 win.setIgnoreMouseEvents(true) 一次都没下发，
+ * 屏幕右下角那块全透明置顶窗口就一直吃桌面点击（看着像桌面坏了）。
+ * null = 还没下发过，第一次调用一定会真的执行。
+ */
+let ignoring = null;
 
 /**
  * 窗口尺寸统一走 setContentBounds，而不是 setBounds。
@@ -157,6 +212,11 @@ function applyWindowBounds(rect) {
  */
 function movePetTo(x, y) {
   if (!win || win.isDestroyed()) return;
+  // NaN/Infinity 传进 setPosition 会让窗口跳到不可知的地方（甚至消失）
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    log('movePetTo 忽略非法坐标 ' + x + ',' + y);
+    return;
+  }
   const nx = Math.round(x);
   const ny = Math.round(y);
   win.setPosition(nx, ny);
@@ -419,14 +479,37 @@ function createWindow() {
       }
     }, 3500);
   });
-  win.webContents.on('render-process-gone', (_e, d) => log('renderer gone ' + JSON.stringify(d)));
-  win.webContents.on('console-message', (_e, level, message) => log('console[' + level + '] ' + message));
+  win.webContents.on('render-process-gone', (_e, d) => {
+    log('renderer gone ' + JSON.stringify(d));
+    // 渲染进程崩了以前只记一行日志：窗口留成一块空白，60ms 轮询还在跑，
+    // 宿主那边还显示"helper 活着"。这里自己重载一次。
+    setTimeout(() => {
+      if (!win || win.isDestroyed()) return;
+      try {
+        win.webContents.reload();
+        log('renderer reloaded');
+      } catch (err) {
+        log('reload fail ' + (err?.message || err));
+      }
+    }, 1000);
+  });
+  // Electron 35 起 console-message 改成只传一个 details 对象（位置参数已废弃，47 会移除）
+  win.webContents.on('console-message', (_e, details) => {
+    const d = details && typeof details === 'object' ? details : null;
+    log('console[' + (d?.level ?? '?') + '] ' + (d?.message ?? String(details)));
+  });
 
 
   win.on('closed', () => {
     log('window closed');
     stopPointerPoll();
     overlays = [];
+    // 窗口没了，"当前穿透状态"也要复位：下次建窗时 ignoring=null，
+    // 第一句 setIgnore(true) 才会真的下发。
+    ignoring = null;
+    petBox = null;
+    lastCursorKey = '';
+    lastHitDbg = null;
     win = null;
   });
 }
@@ -480,6 +563,8 @@ const POINTER_POLL_MS = 60;
 let pollTimer = null;
 
 let lastHitDbg = null;
+/** 最近一次光标命中判定：pet:interactive 收回常态时要用它还原穿透状态 */
+let pointerHit = false;
 
 /**
  * 光标方位回传：渲染端拿它做「视线跟着鼠标」和「悬停反应」。
@@ -527,6 +612,8 @@ function publishCursor(lx, ly) {
 
 function pollPointer() {
   if (!win || win.isDestroyed() || !curBounds.width) return;
+  // 窗口不可见时不必再采样：看不见的东西不吃点击，也没人去点它
+  if (!win.isVisible()) return;
   const p = screen.getCursorScreenPoint();
   const lx = p.x - curBounds.x;
   const ly = p.y - curBounds.y;
@@ -535,11 +622,14 @@ function pollPointer() {
     const zones = [petZone(), ...overlays];
     hit = zones.some((z) => z && lx >= z.x && ly >= z.y && lx < z.x + z.w && ly < z.y + z.h);
   }
+  pointerHit = hit;
   if (hit !== lastHitDbg) {
     lastHitDbg = hit;
     log('pointer hit=' + hit + ' at=' + lx + ',' + ly + ' zones=' + JSON.stringify(overlays));
   }
-  setIgnore(!hit);
+  // 渲染端要求整窗可交互时（菜单/面板正开着），别被轮询翻回穿透 ——
+  // 菜单刚展开那一下点不中，就是这个 60ms 空窗造成的。
+  setIgnore(forceInteractive ? false : !hit);
   try {
     publishCursor(lx, ly);
   } catch (err) {
@@ -558,11 +648,43 @@ function stopPointerPoll() {
   pollTimer = null;
 }
 
+/**
+ * IPC 来源校验。
+ *
+ * 这些通道只该由本进程自己开的那一个窗口发。
+ * 不校验的话，将来窗口里加载了任何外来内容，它都能驱动桌宠
+ * （移动窗口、抛掷、关进程）。sender 对不上就当没听见。
+ */
+function fromPet(e) {
+  return !!win && !win.isDestroyed() && e && e.sender === win.webContents;
+}
+
 ipcMain.on('pet:hotzones', (_e, list) => {
-  overlays = Array.isArray(list) ? list.filter((z) => z && z.w > 0 && z.h > 0) : [];
+  if (!fromPet(_e)) return;
+  // 坐标必须都是有限数：NaN/Infinity 混进来，命中判定会静默失灵，
+  // 光标压在宠物身上也算不中 → 看着就是"点不动"。
+  overlays = Array.isArray(list)
+    ? list
+        .filter(
+          (z) =>
+            z &&
+            [z.x, z.y, z.w, z.h].every((n) => Number.isFinite(n)) &&
+            z.w > 0 &&
+            z.h > 0
+        )
+        .map((z) => ({ x: Math.round(z.x), y: Math.round(z.y), w: Math.round(z.w), h: Math.round(z.h) }))
+    : [];
+  // 浮层刚出现时立刻重判一次命中：否则要等最多 60ms 轮询才翻穿透，
+  // 那一瞬间点菜单会穿透到桌面（"菜单点了没反应"）。
+  try {
+    pollPointer();
+  } catch {
+    /* 指针采样失败不影响 */
+  }
 });
 
 ipcMain.on('pet:contentbox', (_e, box) => {
+  if (!fromPet(_e)) return;
   // 比例得讲道理：宠物本体至少占三成，否则多半是采到了透明帧或半截动作
   if (!box) return;
   const { left, top, right, bottom } = box;
@@ -578,9 +700,22 @@ ipcMain.on('pet:contentbox', (_e, box) => {
   log('contentbox ' + JSON.stringify(petBox) + ' zone=' + JSON.stringify(petZone()));
 });
 
+/**
+ * 渲染端明确要求的整窗可交互状态。
+ *
+ * preload 暴露的 setInteractive(boolean) 是双向的：true = 整窗收鼠标，
+ * false = 回到按光标位置判断。以前主进程只认 true，false 被丢掉，
+ * 于是"菜单收起后回到常态"这个动作永远做不了 ——
+ * 契约只实现了一半。
+ */
+let forceInteractive = false;
+
 ipcMain.on('pet:interactive', (_e, next) => {
+  if (!fromPet(_e)) return;
   // 渲染端只在"确实需要整窗接收"时用这个快通道；常态交给轮询
-  if (next === true) setIgnore(false);
+  forceInteractive = next === true;
+  if (forceInteractive) setIgnore(false);
+  else setIgnore(!pointerHit);
 });
 
 /**
@@ -779,6 +914,7 @@ function startWalk(targetX, speed = 80, opts = {}) {
  * 主进程按播放时间插值把窗口挪过去。
  */
 ipcMain.on('pet:walk-begin', (_e, msg) => {
+  if (!fromPet(_e)) return;
   if (!win || win.isDestroyed() || !msg) return;
   const dx = Number(msg.dx);
   if (!Number.isFinite(dx) || Math.abs(dx) < 4) return;
@@ -787,6 +923,7 @@ ipcMain.on('pet:walk-begin', (_e, msg) => {
 });
 
 ipcMain.on('pet:walk', (_e, msg) => {
+  if (!fromPet(_e)) return;
   if (!msg) return;
   if (msg.stop) {
     stopWalk('cancel');
@@ -801,10 +938,16 @@ ipcMain.on('pet:walk', (_e, msg) => {
 });
 
 ipcMain.on('pet:drag', (_e, msg) => {
+  if (!fromPet(_e)) return;
   if (!win || win.isDestroyed() || !msg) return;
   if (msg.phase === 'start') {
     stopPhysics();
     stopWalk('drag');
+    // 坐标必须是有限数：NaN 会把 dragOffset 变成 NaN，之后 movePetTo 一直搬 NaN
+    if (!Number.isFinite(msg.screenX) || !Number.isFinite(msg.screenY)) {
+      log('pet:drag start 非法坐标');
+      return;
+    }
     const [wx, wy] = win.getPosition();
     dragOffset = { dx: msg.screenX - wx, dy: msg.screenY - wy };
     return;
@@ -825,11 +968,13 @@ ipcMain.on('pet:drag', (_e, msg) => {
     return;
   }
   if (!dragOffset) return;
+  if (!Number.isFinite(msg.screenX) || !Number.isFinite(msg.screenY)) return;
   movePetTo(msg.screenX - dragOffset.dx, msg.screenY - dragOffset.dy);
 });
 
 /** 渲染端回报宠物实际宽度，据此调整窗口大小（滚轮缩放 / 设置里改尺寸都走这里） */
 ipcMain.on('pet:resize', (_e, width) => {
+  if (!fromPet(_e)) return;
   if (!win || win.isDestroyed()) return;
   const w = Math.max(120, Math.min(640, Math.round(Number(width) || DEFAULT_PET_W)));
   if (w === petWidth) return;
@@ -847,6 +992,7 @@ ipcMain.on('pet:resize', (_e, width) => {
  */
 let panelExtra = 0;
 ipcMain.on('pet:grow', (_e, extra) => {
+  if (!fromPet(_e)) return;
   const next = Math.max(0, Math.min(HUD_MAX, Math.round(Number(extra) || 0)));
   if (next !== panelExtra) {
     panelExtra = next;
@@ -854,16 +1000,23 @@ ipcMain.on('pet:grow', (_e, extra) => {
   }
 });
 
-ipcMain.on('pet:quit', () => {
+ipcMain.on('pet:quit', (e) => {
+  if (!fromPet(e)) return;
   app.quit();
 });
 
-ipcMain.handle('pet:env', () => ({
-  host: HOST_ORIGIN,
-  petWidth,
-  ignoring,
-  version: process.versions.electron,
-}));
+ipcMain.handle('pet:env', (e) => {
+  if (!fromPet(e)) return null;
+  return {
+    host: HOST_ORIGIN,
+    // 跨源令牌：渲染端每个请求都得带上，别落到 localStorage / 日志里
+    token: PET_TOKEN,
+    petWidth,
+    // 回报真实的穿透状态：ignoring 可能是 null（还没下发过），别把它当成"没穿透"
+    ignoring: ignoring === true,
+    version: process.versions.electron,
+  };
+});
 
 app.whenReady().then(() => {
   // 没抢到锁说明已经有宠物在跑：这时候只该退出，别再开一个窗口闪一下
@@ -871,11 +1024,30 @@ app.whenReady().then(() => {
   log('app ready');
   // 应用菜单在无边框窗口里也会响应 Alt 键，清掉
   Menu.setApplicationMenu(null);
-  createWindow();
+  /*
+   * 建窗失败必须显式退出。
+   * 以前 createWindow() 抛异常会变成 whenReady 的 unhandled rejection，
+   * 再被 uncaughtException handler 吞掉 —— 结果进程活着、单实例锁占着、
+   * 一个窗口都没有，宿主那边还显示"helper 在跑"。
+   */
+  try {
+    createWindow();
+  } catch (e) {
+    log('createWindow 失败 ' + (e?.stack || String(e)));
+    app.exit(1);
+    return;
+  }
   log('window created ' + JSON.stringify(curBounds) + ' petZone=' + JSON.stringify(petZone()));
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    if (BrowserWindow.getAllWindows().length === 0) {
+      try {
+        createWindow();
+      } catch (e) {
+        log('createWindow 失败 ' + (e?.stack || String(e)));
+        app.exit(1);
+      }
+    }
   });
 });
 
@@ -884,4 +1056,16 @@ app.on('window-all-closed', () => {
   log('window-all-closed → quit');
   app.quit();
 });
-process.on('uncaughtException', (e) => log('uncaught', e?.stack || String(e)));
+process.on('uncaughtException', (e) => {
+  log('uncaught', e?.stack || String(e));
+  // 致命错误别硬撑：进程半死不活，宿主还以为它在跑
+  const fatal = /ERR_[A-Z_]+/.test(String(e?.code || e?.message || ''));
+  if (fatal) {
+    log('致命错误，退出 ' + (e?.code || e?.message));
+    app.exit(1);
+  }
+});
+// 未处理的 Promise 拒绝以前没人管：跟未捕获异常一样静默吞掉，问题看不见
+process.on('unhandledRejection', (reason) => {
+  log('unhandledRejection ' + (reason?.stack || String(reason)));
+});

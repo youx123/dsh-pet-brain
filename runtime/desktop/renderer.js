@@ -12,6 +12,11 @@
 (() => {
   const hostParam = new URLSearchParams(location.search).get('host');
   let HOST = hostParam || 'http://127.0.0.1:3080';
+  /**
+   * 宿主令牌：boot 时从 preload 的 env() 拿，之后的每个请求都带上。
+   * 只放内存里 —— 写 localStorage 等于把令牌摊在用户目录里，没必要。
+   */
+  let PET_TOKEN = '';
 
   const $ = (id) => document.getElementById(id);
   const pet = $('pet');
@@ -52,6 +57,19 @@
   let lastSaidAt = 0;
   /** 是否已有一路在向宿主讨话：防止两次生成前后脚冒泡 */
   let speakInFlight = false;
+  /**
+   * 上一次向宿主要话的结果备注（'silent' / 'quiet-period' / 'busy' / 'error:…'）。
+   * 以前只写不读，而且是隐式全局（挂在 window 上），排障时在 /pet-brain/state 里看不见。
+   */
+  let lastSpeakNote = '';
+  /**
+   * 最近一次 /pet-brain/speak 的完整返回。
+   *
+   * 宿主说"这轮不说"时，返回里带着它自己算的 retryMs / intervalMs ——
+   * 以前 askHostSpeak 只说"没话"就返回 null，这两个数字就丢了，
+   * 于是每轮都退回 90~240 秒的瞎猜间隔。
+   */
+  let lastSpeakRes = null;
   /**
    * 已经接过的「共享大脑那一轮」的时间戳。
    *
@@ -131,17 +149,37 @@ let THINK_DELAY_MS = 4_000;
   const bootedAt = Date.now();
 
   // ---- 与宿主通信 -------------------------------------------------------
-  async function api(path, init) {
-    const res = await fetch(HOST + path, init);
-    if (!res.ok) throw new Error(path + ' → ' + res.status);
-    return res.json();
+  /**
+   * 跟宿主说话。
+   *
+   * 必须带超时：/pet-brain/speak 要等宿主把模型跑完才回话，
+   * 碰上宿主卡住不回，这次 fetch 就永远挂着 ——
+   * 而 speakInFlight 是靠 finally 复位的，挂住 = 桌宠这一局再也不开口。
+   */
+  async function api(path, init = {}) {
+    const ctrl = new AbortController();
+    const ms = init.timeoutMs ?? 45_000;
+    const timer = setTimeout(() => ctrl.abort(), ms);
+    try {
+      // file:// 页面对宿主来说是跨源，必须带上令牌，否则一律 403。
+      // 令牌只在内存里，不落 localStorage、不进 ping（诊断日志会被看）。
+      const headers = { ...(init.headers || {}) };
+      if (PET_TOKEN) headers['x-pet-token'] = PET_TOKEN;
+      const res = await fetch(HOST + path, { ...init, headers, signal: ctrl.signal });
+      if (!res.ok) throw new Error(path + ' → ' + res.status);
+      return await res.json();
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /** 把启动进度回传给宿主，宿主的 /pet-brain/state 里能直接看到（排障用） */
   function ping(stage, detail = '') {
+    const headers = { 'content-type': 'application/json' };
+    if (PET_TOKEN) headers['x-pet-token'] = PET_TOKEN;
     fetch(HOST + '/pet-brain/ping', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers,
       body: JSON.stringify({ stage: 'desk.' + stage, detail: String(detail).slice(0, 300) }),
     }).catch(() => {});
   }
@@ -183,6 +221,21 @@ let THINK_DELAY_MS = 4_000;
   }
 
   const blobCache = new Map();
+  /**
+   * 素材一共 52 个、约 24MB。blob URL 一旦建了就一直攥在渲染进程手里，
+   * 不回收就是纯内存泄漏（旧动作被淘汰了也还占着）。
+   * 留个上限，超了就按插入顺序回收最老的。
+   */
+  const BLOB_CACHE_MAX = 24;
+  function cacheBlob(name, url) {
+    blobCache.set(name, url);
+    while (blobCache.size > BLOB_CACHE_MAX) {
+      const oldest = blobCache.keys().next().value;
+      if (oldest === undefined) break;
+      try { URL.revokeObjectURL(blobCache.get(oldest)); } catch { /* 已经回收过 */ }
+      blobCache.delete(oldest);
+    }
+  }
   let currentAnim = '';
   /** 当前动作的基准倍速：光标压在它身上时在这个基础上再快一点（"呼吸加快"） */
   let currentRate = 1;
@@ -222,7 +275,25 @@ let THINK_DELAY_MS = 4_000;
    * rate 是播放倍速：素材统一 10 秒，走位时压到 1.5 倍，走起来不拖沓。
    */
   async function playAnim(name, loop = true, rate = 1, onEnded = null) {
-    if (!name || name === currentAnim) return null;
+    if (!name) return null;
+    if (name === currentAnim) {
+      /*
+       * 同名 = 重播，不是"无事发生"。
+       * 原来这里直接 return null，于是"点它"（动作池刚好抽中当前动作）、
+       * "去吃饭"、"溜达"这些路径会静默失败 —— 看着就是点了没反应。
+       * 同名就重播当前这块视频：动作一样，至少有反应。
+       */
+      const v = vids[front];
+      if (!v) return null;
+      v.loop = loop;
+      currentRate = rate;
+      applyRate();
+      if (typeof onEnded === 'function') v.onended = onEnded;
+      try { v.currentTime = 0; } catch { /* 没解码完就让它自己播 */ }
+      void v.play().catch(() => {});
+      if (!loop) lastReactionAt = Date.now();
+      return v;
+    }
     // 播别的动作就等于醒了：睡眠状态要跟着收掉（不然徽章一直挂着睡觉中）
     if (sleeping && !SLEEP_CLIPS.has(name)) cancelSleep();
     // 同理，追饭的戏被别的动作抢走就散场，不然状态卡住、宠物再也不溜达
@@ -235,7 +306,7 @@ let THINK_DELAY_MS = 4_000;
         const res = await fetch(`${HOST}/pet-brain/anim/${encodeURIComponent(name)}.webm`);
         if (!res.ok) throw new Error(`${name} → ${res.status}`);
         url = URL.createObjectURL(await res.blob());
-        blobCache.set(name, url);
+        cacheBlob(name, url);
       }
       if (token !== animToken) return; // 已经切到别的动作了，这次作废
       const back = vids[1 - front];
@@ -261,12 +332,14 @@ let THINK_DELAY_MS = 4_000;
       if (token !== animToken) return;
       // 两块在同一帧里切显隐，浏览器不会渲染出中间态
       back.classList.add('show');
-      vids[front].classList.remove('show');
+      const old = vids[front];
+      old.classList.remove('show');
+      old.pause(); // 旧的那块别再解码了 —— 两块一起解，白烧 CPU
       front = 1 - front;
       ping('anim.ok', name);
       lastAnimName = name;
       // 第一个有画面的动作到位后就量一次轮廓（待机最好，但别的动作也是同一只宠物）
-      setTimeout(probeContentBox, 350);
+      if (!boxProbed) setTimeout(probeContentBox, 350);
       return back;
     } catch (e) {
       // 素材缺失就退回待机，不要把窗口搞成空白
@@ -347,6 +420,15 @@ let THINK_DELAY_MS = 4_000;
     noon: ['这个点了，吃了吗', '中午了，先扒口饭'],
     night: ['还不睡？我陪你一会儿', '夜深了，别熬太狠'],
   };
+
+  /** 老大那边一轮活干完时说的话：换着说，别天天复读 */
+  const WORK_DONE_LINES = [
+    '这轮干完啦，歇会儿？',
+    '收工，抖抖手',
+    '搞定，歇三秒再战',
+    '这段跑完了，喝口水去',
+    '这块儿结了，下一件上',
+  ];
 
   function hourBucket() {
     const h = new Date().getHours();
@@ -483,11 +565,15 @@ let THINK_DELAY_MS = 4_000;
         body: JSON.stringify({ ...extra, ...(force ? { force: true } : {}) }),
       });
       if (res?.action !== 'speak' || !res?.text) {
-        // 宿主说"这轮不用说"的话，把原因留下来：排障时能看出是安静期、时间窗还是模型挂了
+        // 宿主说"这轮不用说"的话，把原因留下来：排障时能看出是安静期、时间窗还是模型挂了。
+        // 顺便记下整份返回 —— 里面的 retryMs 是宿主自己算的"什么时候再来问"，
+        // 丢了就只能瞎猜一个 90~240 秒（以前就是这样，所以安静期一过还得再等两三分钟）。
         lastSpeakNote = res?.reason || 'silent';
+        lastSpeakRes = res || null;
         return null;
       }
       lastSpeakNote = res?.reason || 'speak';
+      lastSpeakRes = res;
       return res;
     } catch (e) {
       lastSpeakNote = 'error:' + String(e?.message || e);
@@ -495,6 +581,8 @@ let THINK_DELAY_MS = 4_000;
       return null;
     } finally {
       speakInFlight = false;
+      // 把这次的结果报给宿主：排障时一眼看出是安静期、时间窗还是模型挂了
+      ping('speak.note', lastSpeakNote);
     }
   }
 
@@ -513,7 +601,9 @@ let THINK_DELAY_MS = 4_000;
       if (seq !== reactSeq) return;
       lastAskThought = true;
       playAnim(cfg?.animations?.thinking || '工作状态-思考冒泡', true);
-      say('…', 12_000, '', { silent: true, kind: 'thinking' });
+      // 气泡挂久一点：模型跑完常常要几十秒，12 秒就把「…」收了，
+      // 中间那阵看着像"想不出来卡住了"。
+      say('…', 60_000, '', { silent: true, kind: 'thinking' });
       ping('speak.wait', 'over ' + Math.round(THINK_DELAY_MS / 1000) + 's');
     }, THINK_DELAY_MS);
     try {
@@ -562,9 +652,12 @@ let THINK_DELAY_MS = 4_000;
           if (toneAnim) playAnim(toneAnim, false);
           ping('speak.ok', `${res.reason}/${res.tone} ${res.text.slice(0, 24)}`);
         } else {
-          ping('speak.skip', res?.reason || 'silent');
+          ping('speak.skip', res?.reason || lastSpeakNote || 'silent');
         }
-        scheduleChatter(res?.intervalMs);
+        // 宿主没给话时，用它自己算的 retryMs（安静期 90 秒左右）而不是瞎猜 90~240 秒；
+        // 给了话就按 intervalMs（共享大脑的间隔 ±50%）排下一轮。
+        const next = res?.intervalMs ?? lastSpeakRes?.retryMs ?? 0;
+        scheduleChatter(next);
       } else {
         // 忙/睡着/被关掉自动互动：不硬挤，过一分钟再看
         scheduleChatter(60_000);
@@ -691,6 +784,24 @@ let THINK_DELAY_MS = 4_000;
     if (click) onTap(tapZone(e.clientX, e.clientY));
     else if (Math.hypot(vel.vx, vel.vy) < 140) playAnim('待机呼吸休闲', true);
   });
+
+  /**
+   * 拖到一半断电的兜底。
+   *
+   * 只有 pointerup 一条出路：拖着的时候切窗口、锁屏、任务栏抢走指针，
+   * pointerup 就不来了 → dragging 永远为真 →
+   * 溜达、睡觉、换动作全被挡死，桌宠从此变成一块不会动的贴纸。
+   */
+  function abortDrag() {
+    if (!dragging) return;
+    dragging = null;
+    velSamples = [];
+    window.petDesk.drag('end', 0, 0, 0, 0);
+    playAnim('待机呼吸休闲', true);
+    ping('drag.abort', 'pointer lost');
+  }
+  window.addEventListener('pointercancel', abortDrag);
+  window.addEventListener('blur', abortDrag);
 
   /** 最近一次落地撞击强度（探针用来验证物理真的跑起来了） */
   let lastLand = null;
@@ -1133,7 +1244,12 @@ let THINK_DELAY_MS = 4_000;
 
   // ---- 交互 -------------------------------------------------------------
   function onTap(zone = 'body') {
-    menu.hidden = true;
+    // 藏了菜单就得把热区也收回去，不然主进程那边还留着菜单那块，
+    // 直到下一次 syncGrow 之前那一片点不到桌面。
+    if (!menu.hidden) {
+      menu.hidden = true;
+      syncGrow();
+    }
     // 走着被点：先站住，不然她一边滑行一边演点击回应，像在溜冰
     if (walking) stopWalk();
     // 睡着的时候点一下就是叫醒，别搭话
@@ -1690,9 +1806,20 @@ let THINK_DELAY_MS = 4_000;
   });
 
   // ---- 主循环 -----------------------------------------------------------
+  /**
+   * 轮询序号。
+   *
+   * 2 秒一轮，宿主忙时一轮可能超过 2 秒 → 两轮并发。
+   * 旧的那轮后到就把 state 覆盖成旧值："刚干完活"被误判成"还在干活"，
+   * 桌宠的动作跟着来回倒。只认最新那次。
+   */
+  let pollSeq = 0;
   async function poll() {
+    const mySeq = ++pollSeq;
     try {
-      state = await api('/pet-brain/state');
+      const st = await api('/pet-brain/state');
+      if (mySeq !== pollSeq) return; // 已经有更新的结果了，这次作废
+      state = st;
       if (!polledOnce) {
         polledOnce = true;
         ping('state.ok', `mood=${state?.mood?.mood ?? '?'} actions=${state?.actions?.length ?? 0}`);
@@ -1702,7 +1829,7 @@ let THINK_DELAY_MS = 4_000;
 
       // 工作状态：老大在忙就安静干活，干完了冒一句
       const w = state?.work;
-      const busyScene = sleeping || baifanPhase >= 0; // 睡觉/追饭时不插播工作动作
+      const busyScene = sleeping || baifanPhase >= 0 || !!dragging; // 睡觉/追饭/被拎着时不插播工作动作
       if (w && w.status !== lastWorkStatus) {
         if (w.status === 'running' && w.action) {
           // 记住这轮活儿的起点：满四十五分钟要提醒起来动动
@@ -1719,7 +1846,10 @@ let THINK_DELAY_MS = 4_000;
             playAnim('待机呼吸休闲', true);
             ping('work.idle', 'turns=' + (w.turns ?? 0));
           }
-          if (!quiet && !panelKind && bubble.hidden) say('这轮干完啦，歇会儿？', 9000, '', { record: true });
+          if (!quiet && !panelKind && bubble.hidden) {
+            // 每次干完活都说同一句，一天天听下来就是复读机。换着说。
+            say(withEmoji(pick(WORK_DONE_LINES)), 9000, '', { record: true });
+          }
         }
         lastWorkStatus = w.status;
       } else if (w && w.status === 'running') {
@@ -1762,13 +1892,14 @@ let THINK_DELAY_MS = 4_000;
         now - lastSaidAt > HOST_FOLLOW_GAP_MS
       ) {
         hostFollowBusy = true;
-        void api('/pet-brain/speak', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ follow: true }),
-        })
+        /*
+         * 走 askHostSpeak，不自己裸调 api()：
+         * 裸调就绕开了 speakInFlight 这道闸 —— 共享大脑接茬和主动搭话/点击反应
+         * 能同时要话，两次 LLM 生成、两个气泡前后脚冒出来，一句压一句。
+         */
+        void askHostSpeak(false, { follow: true })
           .then((res) => {
-            if (res?.action === 'speak' && res?.text) {
+            if (res?.text) {
               // 这一条接过了，记住：别再接一遍
               hostFollowSeenAt = h.at;
               hostFollowRetryAt = 0;
@@ -1777,9 +1908,12 @@ let THINK_DELAY_MS = 4_000;
               if (toneAnim) playAnim(toneAnim, false);
               say(res.text, 15000, res.emoji || '', { kind: 'proactive' });
               ping('host.follow', `${res.reason} ${res.text.slice(0, 24)}`);
+            } else if (lastSpeakNote === 'busy') {
+              // 另一路正在要话：不记账，下一轮轮询接着接（h.at 还在，不会丢）
+              ping('host.follow.busy', 'speak in flight');
             } else {
               hostFollowRetryAt = now + FOLLOW_RETRY_MS;
-              ping('host.follow.skip', res?.reason || 'silent');
+              ping('host.follow.skip', res?.reason || lastSpeakNote || 'silent');
             }
           })
           .catch((e) => {
@@ -1796,16 +1930,18 @@ let THINK_DELAY_MS = 4_000;
   }
 
   async function boot() {
-    // 顺带把自动互动的开关状态报上来：排障时一眼看出是不是被"关掉自动互动"摁住了
-    ping('boot', quiet ? 'auto=off' : 'auto=on');
     try {
       const env = await window.petDesk.env();
       if (env?.host) HOST = env.host;
-      ping('env', HOST);
+      if (typeof env?.token === 'string') PET_TOKEN = env.token;
+      // 只报"有没有拿到"，不把令牌本身写进诊断日志
+      ping('env', HOST + (PET_TOKEN ? ' token=ok' : ' token=none'));
     } catch (e) {
       /* preload 不可用时退回 URL 参数 */
       ping('env.fail', String(e?.message || e));
     }
+    // 顺带把自动互动的开关状态报上来：排障时一眼看出是不是被"关掉自动互动"摁住了
+    ping('boot', quiet ? 'auto=off' : 'auto=on');
     try {
       cfg = await api('/pet-brain/config');
       ping('config.ok', `${cfg?.animations ? 'anim ok' : 'no anim'}`);
@@ -1823,10 +1959,25 @@ let THINK_DELAY_MS = 4_000;
         }
       })
       .catch(() => {});
-    setInterval(poll, 2000);
+    const pollTimer = setInterval(poll, 2000);
+    window.addEventListener('beforeunload', () => clearInterval(pollTimer));
     applyScale();
     window.petDesk.resize(PET_SIZE);
     scheduleChatter();
+    /*
+     * 按时段打个招呼。
+     * 这组问候语早就写好了，可是一直没接上开关 —— 早/中午/夜里那三档从来没触发过。
+     * 起床时冒一句"早啊"，比十分钟后突然冒泡自然得多。
+     */
+    try {
+      const hb = hourBucket();
+      if (hb && HOUR_LINES[hb]?.length) {
+        say(withEmoji(pick(HOUR_LINES[hb])), 8000, '', { record: true });
+        ping('hour.hello', hb);
+      }
+    } catch {
+      /* 打招呼失败不影响别的 */
+    }
     setTimeout(() => {
       const r = pet.getBoundingClientRect();
       ping('rect', `${Math.round(r.width)}x${Math.round(r.height)}@${Math.round(r.x)},${Math.round(r.y)}`);
@@ -1993,9 +2144,16 @@ let THINK_DELAY_MS = 4_000;
      * 正常是四秒，靠真等一小时才撞得上不合适。
      */
     think: async () => {
+      // 临时压小，等这一轮走完必须还原 ——
+      // 不还原的话跑过一次自检，这一局所有"思考"都变成 0.3 秒。
+      const old = THINK_DELAY_MS;
       THINK_DELAY_MS = 300;
-      onTap('body');
-      await new Promise((r) => setTimeout(r, 1_500));
+      try {
+        onTap('body');
+        await new Promise((r) => setTimeout(r, 1_500));
+      } finally {
+        THINK_DELAY_MS = old;
+      }
       const text = String(bubble.textContent || '').trim().slice(0, 24);
       return 'anim=' + lastAnimName + ' bubble=' + (bubble.hidden ? 'hidden' : 'shown') + ' text=' + text;
     },

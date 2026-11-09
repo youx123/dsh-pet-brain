@@ -48,15 +48,32 @@ contextBridge.exposeInMainWorld('petDesk', {
   quit: () => ipcRenderer.send('pet:quit'),
   env: () => ipcRenderer.invoke('pet:env'),
   /** 落地回调：主进程物理算出撞击强度时通知渲染端做压扁动画 */
-  onLand: (cb) => ipcRenderer.on('pet:land', (_e, info) => cb(info)),
+  // 每次注册都返回退订函数：以前重复注册会堆一堆 listener，事件来一次回调 N 次
+  onLand: (cb) => {
+    const h = (_e, info) => cb(info);
+    ipcRenderer.on('pet:land', h);
+    return () => ipcRenderer.off('pet:land', h);
+  },
   /** 开始走动：dir=1 向右、-1 向左，渲染端据此决定播走路动画和要不要镜像 */
-  onWalkStart: (cb) => ipcRenderer.on('pet:walk-start', (_e, info) => cb(info)),
+  onWalkStart: (cb) => {
+    const h = (_e, info) => cb(info);
+    ipcRenderer.on('pet:walk-start', h);
+    return () => ipcRenderer.off('pet:walk-start', h);
+  },
   /** 走完 / 被打断 */
-  onWalkEnd: (cb) => ipcRenderer.on('pet:walk-end', (_e, info) => cb(info)),
+  onWalkEnd: (cb) => {
+    const h = (_e, info) => cb(info);
+    ipcRenderer.on('pet:walk-end', h);
+    return () => ipcRenderer.off('pet:walk-end', h);
+  },
   /**
    * 光标方位（主进程 60ms 采样，只在变化时推）：
    * { side: -1|0|1, over: 是否悬在宠物身上, inside: 是否还在窗口内, nx, ny }
    * 渲染端拿它做视线跟随和悬停反应。
    */
-  onCursor: (cb) => ipcRenderer.on('pet:cursor', (_e, info) => cb(info)),
+  onCursor: (cb) => {
+    const h = (_e, info) => cb(info);
+    ipcRenderer.on('pet:cursor', h);
+    return () => ipcRenderer.off('pet:cursor', h);
+  },
 });
