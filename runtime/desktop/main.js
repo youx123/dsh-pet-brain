@@ -178,6 +178,9 @@ let petWidth = DEFAULT_PET_W;
  */
 let ignoring = null;
 
+/** 排障自检（PET_BRAIN_AUTO_PANEL）的定时器句柄：建窗/重建时要能清掉上一轮 */
+let debugTimer = 0;
+
 /**
  * 窗口尺寸统一走 setContentBounds，而不是 setBounds。
  *
@@ -296,6 +299,34 @@ function createWindow() {
   // 右键菜单由渲染端自绘，屏蔽 Electron 默认菜单（否则两个菜单一起弹）
   win.webContents.on('context-menu', (e) => e.preventDefault());
 
+  /*
+   * 兜底拦截三件套。
+   *
+   * 桌宠只会显示自己的 index.html、只会往宿主 origin 发请求。现在页面里没有跳转入口，
+   * 但这层不该靠"代码里恰好没写 <a>"来保证：某天面板里渲染了带链接的文本、
+   * 或者打开的网页里又开了弹窗，默认行为就是把桌宠这个窗口换成一张网页 ——
+   * 于是右下角那个东西既不是宠物、也没有穿透，看着像桌面坏了。
+   */
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    log('window.open blocked ' + String(url).slice(0, 120));
+    return { action: 'deny' };
+  });
+  win.webContents.on('will-navigate', (e, url) => {
+    // 只放行自己这份 index.html 的加载（含 ?host= 查询串）
+    if (/^file:\/\/.+\/index\.html(\?|$)/i.test(String(url))) return;
+    e.preventDefault();
+    log('will-navigate blocked ' + String(url).slice(0, 120));
+  });
+  // 权限一律不给：一只桌宠不需要摄像头、麦克风、定位、通知
+  try {
+    win.webContents.session.setPermissionRequestHandler((_wc, permission, cb) => {
+      log('permission denied ' + permission);
+      cb(false);
+    });
+  } catch (e) {
+    log('permission handler 装不上 ' + String(e?.message || e));
+  }
+
   // 记下建窗时的实际内容区，后面 pet:grow 算底边要用（不回读窗口，避免取整误差）
   {
     const b = win.getContentBounds();
@@ -314,7 +345,11 @@ function createWindow() {
   });
   // paintWhenInitiallyHidden:false 时 ready-to-show 可能永不触发，补一次兜底
   win.webContents.once('did-finish-load', () => {
-    setTimeout(async () => {
+    // 句柄要存着：窗口重建（render-process-gone 自愈、second-instance 换源）时
+    // 上一轮的排障定时器还在跑，3.5 秒后会打到新窗口上，串成莫名其妙的截图/面板。
+    if (debugTimer) clearTimeout(debugTimer);
+    debugTimer = setTimeout(async () => {
+      debugTimer = 0;
       if (!win || win.isDestroyed()) return;
       // 排障用：设了 PET_BRAIN_AUTO_PANEL 就把对应面板打开再截图
       const auto = process.env.PET_BRAIN_AUTO_PANEL;
@@ -503,6 +538,11 @@ function createWindow() {
   win.on('closed', () => {
     log('window closed');
     stopPointerPoll();
+    // 排障定时器也要清：不清的话窗口关了它还会醒一次，去打一个已销毁的 webContents
+    if (debugTimer) {
+      clearTimeout(debugTimer);
+      debugTimer = 0;
+    }
     overlays = [];
     // 窗口没了，"当前穿透状态"也要复位：下次建窗时 ignoring=null，
     // 第一句 setIgnore(true) 才会真的下发。
