@@ -53,4 +53,10 @@ contextBridge.exposeInMainWorld('petDesk', {
   onWalkStart: (cb) => ipcRenderer.on('pet:walk-start', (_e, info) => cb(info)),
   /** 走完 / 被打断 */
   onWalkEnd: (cb) => ipcRenderer.on('pet:walk-end', (_e, info) => cb(info)),
+  /**
+   * 光标方位（主进程 60ms 采样，只在变化时推）：
+   * { side: -1|0|1, over: 是否悬在宠物身上, inside: 是否还在窗口内, nx, ny }
+   * 渲染端拿它做视线跟随和悬停反应。
+   */
+  onCursor: (cb) => ipcRenderer.on('pet:cursor', (_e, info) => cb(info)),
 });

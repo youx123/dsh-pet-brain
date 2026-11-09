@@ -38,8 +38,15 @@ const BADGE_SPACE = 26;
 /** 默认宠物宽度（渲染端会按实际尺寸回报，主进程据此调整窗口） */
 const DEFAULT_PET_W = 462;
 
-/** 宿主 origin，由 lib/desktop.js 通过参数传进来 */
-const HOST_ORIGIN = (() => {
+/**
+ * 宿主 origin，由 lib/desktop.js 通过参数传进来。
+ *
+ * 用 let 不用 const：DSH 重启后端口会变（每次都是随机端口），插件在启动时
+ * 会再拉一次桌面助手，但单实例锁会让新进程直接退出 —— 于是留下一个还指着
+ * 上一轮死端口的旧窗口，点什么都没反应。第二条实例的命令行里带着新 origin，
+ * 靠下面的 second-instance 把它换过来（见 on('second-instance')）。
+ */
+let HOST_ORIGIN = (() => {
   const arg = process.argv.find((a) => a.startsWith('--host='));
   return arg ? arg.slice('--host='.length) : 'http://127.0.0.1:3080';
 })();
@@ -77,6 +84,30 @@ if (!gotLock) {
   log('无锁，退出');
   app.quit();
 }
+
+/**
+ * 第二条实例（通常来自 DSH 重启后的自动拉起）把自己的 --host 递过来。
+ *
+ * 宿主每次启动端口都不一样，老窗口指着旧端口 → 轮询 404、点击没回话，
+ * 看上去就是"桌宠死了"。这里换掉 origin 重载页面，等于免费自愈。
+ */
+app.on('second-instance', (_evt, argv) => {
+  if (!win) return;
+  const arg = (argv || []).find((a) => a.startsWith('--host='));
+  const next = arg ? arg.slice('--host='.length) : '';
+  log('second-instance host=' + (next || '(none)') + ' 现在=' + HOST_ORIGIN);
+  if (next && next !== HOST_ORIGIN) {
+    HOST_ORIGIN = next;
+    win.loadFile(path.join(__dirname, 'index.html'), { query: { host: HOST_ORIGIN } });
+    return;
+  }
+  // 同一个 origin：说明只是被重复拉起，把窗口亮一下就行
+  try {
+    win.showInactive();
+  } catch {
+    /* 窗口已销毁，忽略 */
+  }
+});
 
 
 /**
@@ -304,6 +335,55 @@ function createWindow() {
             }
             const report = await p;
             log('baifan ' + report);
+          } else if (auto === 'gazeleft' || auto === 'gazeright' || auto === 'hover') {
+            // 视线/悬停：直接喂一条光标消息，不用真去挪鼠标
+            const side = auto === 'gazeleft' ? -1 : auto === 'gazeright' ? 1 : 0;
+            const over = auto === 'hover';
+            const report = await win.webContents.executeJavaScript(
+              `window.__petDeskTest.cursor(${side}, ${over ? 'true' : 'false'})`
+            );
+            log('cursor ' + report);
+            await new Promise((r) => setTimeout(r, 900));
+          } else if (auto === 'taphead' || auto === 'tapbody') {
+            const report = await win.webContents.executeJavaScript(
+              `window.__petDeskTest.tap(${JSON.stringify(auto === 'taphead' ? 'head' : 'body')})`
+            );
+            log('tap ' + report);
+            await new Promise((r) => setTimeout(r, 1200));
+          } else if (auto === 'hoverlook') {
+            // 悬停盯久了会不会抬头/被看毛：先把画面钉在非待机动作上
+            // （以前"抬头看你"卡着"必须正待机"，动作池上线后就再没触发过），
+            // 再喂一条"悬停中"，等六秒让它自己演
+            await win.webContents.executeJavaScript('window.__petDeskTest.pose("写代码")');
+            const report = await win.webContents.executeJavaScript('window.__petDeskTest.cursor(0, true)');
+            log('hoverlook ' + report);
+            await new Promise((r) => setTimeout(r, 6_000));
+          } else if (auto === 'think') {
+            const report = await win.webContents.executeJavaScript('window.__petDeskTest.think()');
+            log('think ' + report);
+            await new Promise((r) => setTimeout(r, 200));
+          } else if (auto === 'freeze') {
+            // 一次性动作播完会不会僵在最后一帧：点一下，等八秒再看它站没站回去
+            const report = await win.webContents.executeJavaScript('window.__petDeskTest.tap("body")');
+            log('freeze ' + report);
+            await new Promise((r) => setTimeout(r, 8_000));
+            const after = await win.webContents.executeJavaScript('window.__petDeskTest.animNow()');
+            log('freeze-after ' + after);
+            // 素材普遍 10 秒，再等一轮确认它真的接回待机了
+            await new Promise((r) => setTimeout(r, 5_000));
+            const after2 = await win.webContents.executeJavaScript('window.__petDeskTest.animNow()');
+            log('freeze-after2 ' + after2);
+          } else if (auto === 'stretch') {
+            const report = await win.webContents.executeJavaScript('window.__petDeskTest.stretch()');
+            log('stretch ' + report);
+            await new Promise((r) => setTimeout(r, 1_000));
+          } else if (auto === 'poke') {
+            const report = await win.webContents.executeJavaScript('window.__petDeskTest.poke()');
+            log('poke ' + report);
+            await new Promise((r) => setTimeout(r, 600));
+          } else if (auto === 'motive') {
+            const report = await win.webContents.executeJavaScript('window.__petDeskTest.motive()');
+            log('motive ' + report);
           } else if (auto === 'menu') {
             // 派发一次右键，验证菜单样式
             await win.webContents.executeJavaScript(
@@ -400,6 +480,51 @@ const POINTER_POLL_MS = 60;
 let pollTimer = null;
 
 let lastHitDbg = null;
+
+/**
+ * 光标方位回传：渲染端拿它做「视线跟着鼠标」和「悬停反应」。
+ *
+ * 只在方位档位（左/中/右）、是否悬在宠物身上、是否还在窗口内这三件事变化时才发，
+ * 不然 60ms 一条 IPC，渲染端每秒要处理十六次无关更新。
+ */
+let lastCursorKey = '';
+function publishCursor(lx, ly) {
+  if (!win || win.isDestroyed()) return;
+  const zone = petZone();
+  const inside = lx >= 0 && ly >= 0 && lx < curBounds.width && ly < curBounds.height;
+  const over =
+    inside &&
+    lx >= zone.x &&
+    ly >= zone.y &&
+    lx < zone.x + zone.w &&
+    ly < zone.y + zone.h;
+  const cx = zone.x + zone.w / 2;
+  const cy = zone.y + zone.h / 2;
+  const nx = (lx - cx) / Math.max(1, zone.w / 2);
+  const ny = (ly - cy) / Math.max(1, zone.h / 2);
+  // 死区 0.18：正中那一小段算"正对着"，免得手一抖就左右横跳
+  const side = nx < -0.18 ? -1 : nx > 0.18 ? 1 : 0;
+  /*
+   * 离得远就别一直扭着脸。
+   * 桌宠贴着屏幕右下角，光标绝大多数时间都在它左边 —— 要是无条件跟，
+   * 它就永远是镜像的那一面，看着像贴反了。只有光标靠近了才扭头看过去，走远了回正。
+   */
+  const dist = Math.hypot(lx - cx, ly - cy);
+  const near = dist < 520;
+  const look = near ? side : 0;
+  const key = look + '|' + (over ? 1 : 0) + '|' + (inside ? 1 : 0);
+  if (key === lastCursorKey) return;
+  lastCursorKey = key;
+  win.webContents.send('pet:cursor', {
+    side: look,
+    over,
+    inside,
+    near,
+    nx: Math.round(nx * 100) / 100,
+    ny: Math.round(ny * 100) / 100,
+  });
+}
+
 function pollPointer() {
   if (!win || win.isDestroyed() || !curBounds.width) return;
   const p = screen.getCursorScreenPoint();
@@ -415,6 +540,11 @@ function pollPointer() {
     log('pointer hit=' + hit + ' at=' + lx + ',' + ly + ' zones=' + JSON.stringify(overlays));
   }
   setIgnore(!hit);
+  try {
+    publishCursor(lx, ly);
+  } catch (err) {
+    log('cursor 回传失败 ' + (err?.message || err));
+  }
 }
 
 function startPointerPoll() {
@@ -736,6 +866,8 @@ ipcMain.handle('pet:env', () => ({
 }));
 
 app.whenReady().then(() => {
+  // 没抢到锁说明已经有宠物在跑：这时候只该退出，别再开一个窗口闪一下
+  if (!gotLock) return;
   log('app ready');
   // 应用菜单在无边框窗口里也会响应 Alt 键，清掉
   Menu.setApplicationMenu(null);

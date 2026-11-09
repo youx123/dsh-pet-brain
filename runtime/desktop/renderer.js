@@ -33,7 +33,42 @@
   const HIT_INSET = { x: 0.14, y: 0.16 };
   let dragging = null;
   let bubbleTimer = 0;
-  let quiet = localStorage.getItem('pet-desk:quiet') === '1';
+  /**
+   * 「安静点」= 关掉桌宠的自动互动（共享大脑那边照样说话，桌宠不接）。
+   *
+   * 默认是**开**的：老大要的就是桌宠默认启用共享大脑的自动互动。
+   * 老版本把这个开关写在 'pet-desk:quiet'，调试时点过一次就永久压制 ——
+   * 现在换新 key，并把旧 key 当历史噪音清掉，别让一次误点把互动摁死。
+   */
+  const QUIET_KEY = 'pet-desk:quiet.v2';
+  let quiet = false;
+  try {
+    if (localStorage.getItem('pet-desk:quiet') !== null) localStorage.removeItem('pet-desk:quiet');
+    quiet = localStorage.getItem(QUIET_KEY) === '1';
+  } catch {
+    quiet = false;
+  }
+  /** 桌宠上次开口的时间戳：本地节流用，别连着说 */
+  let lastSaidAt = 0;
+  /** 是否已有一路在向宿主讨话：防止两次生成前后脚冒泡 */
+  let speakInFlight = false;
+  /**
+   * 已经接过的「共享大脑那一轮」的时间戳。
+   *
+   * 宿主那边也记水位线（host.seenAt），但渲染端也得自己记一份：
+   * 宿主的水位线只在 t.follow 为真时推进，两边都记着才不会被带着话痨。
+   */
+  let hostFollowSeenAt = 0;
+  /** 下次允许再问宿主的时刻：宿主没给出话时别每 2 秒问一次 */
+  let hostFollowRetryAt = 0;
+  /** 跟共享大脑接话的最小间隔，跟宿主 lib/index.js 的 PET_FOLLOW_GAP_MS 对齐 */
+  const HOST_FOLLOW_GAP_MS = 45_000;
+  /** 宿主这轮没给出话时，过多久再问一次（别每 2 秒追着问） */
+  const FOLLOW_RETRY_MS = 60_000;
+  /** 已经排过一轮主动搭话没：头一轮等短一点，后头按共享大脑给的间隔来 */
+  let chatterStarted = false;
+  /** 主动搭话的计时器句柄：始终只保留一条链 */
+  let chatterTimer = 0;
   /**
    * 体型固定：跟旧版 dsh-pet 一样是 462px 宽（高 = 462 × 9/16）。
    * 不再提供滚轮缩放 —— 老大要求按旧版固定。
@@ -49,6 +84,51 @@
   let panelKind = '';
   /** 正在跟共享大脑接话：别同时来两次，说成一堆 */
   let hostFollowBusy = false;
+
+  // ---- 灵动相关状态 -----------------------------------------------------
+  // 光标方位：-1 往左看 / 0 正对 / 1 往右看。主进程 60ms 采一次，变化时才推过来。
+  let gazeSide = 0;
+  /** 光标是不是正悬在宠物身上 */
+  let cursorOver = false;
+  /** 这次悬停从什么时候开始（0 = 没悬停） */
+  let hoverSince = 0;
+  /** 悬停期间已经抬头看过没有：看过就别每轮都再看一遍 */
+  let hoverLooked = false;
+  /** 悬停期间已经被"看毛"过没有 */
+  let hoverStartled = false;
+  /** 上一次"被盯毛了"的时刻：带冷却，别一直吓 */
+  let lastStartleAt = 0;
+  /** 连戳计数 / 计数起点：戳三下会不耐烦 */
+  let tapCount = 0;
+  let tapWindowAt = 0;
+  /** 上一次点它去要模型的时刻：三秒内连点不重复生成 */
+  let lastTapAskAt = 0;
+  /** 这轮连续干活的起始时刻；0 = 没在干活 */
+  let workSince = 0;
+  /** 最近一次"在干活"和"刚干完"的时刻，用来挑有动机的动作 */
+  let lastWorkBusyAt = 0;
+  let lastWorkDoneAt = 0;
+  /** 上次伸懒腰提醒 / 深夜陪着的时刻 */
+  let lastStretchAt = 0;
+  let lastNightYawnAt = 0;
+  /** 午后小憩一天只来一次，记日子 */
+  let napDay = '';
+  /** 上一次问宿主是否带出了思考动作（决定回话时要不要再换动作） */
+  let lastAskThought = false;
+/*
+ * 点击反应的批次号。
+ * 连戳的时候每一戳都会各自去要一句模型回复，先发的后到，
+ * 会把"别戳了"这种即时反应盖成一句不相干的话。
+ * 每次点击 +1，回来的那一路只要发现号对不上就自己作废。
+ */
+let reactSeq = 0;
+/**
+ * 等多久还没回话就演「…」。
+ * 正常四秒；自检钩子会临时调小，好让这条路径能被验证到。
+ */
+let THINK_DELAY_MS = 4_000;
+  /** 进程起来的时刻：算"闲了多久"要有起点 */
+  const bootedAt = Date.now();
 
   // ---- 与宿主通信 -------------------------------------------------------
   async function api(path, init) {
@@ -72,10 +152,48 @@
     return pool.length ? pool[Math.floor(Math.random() * pool.length)] : '待机呼吸休闲';
   }
 
+  /**
+   * 挑一个"有动机"的待机动作。
+   *
+   * 以前是从宿主给的池子里纯随机抽，抽到什么算什么 —— 正在写代码的时候
+   * 突然撸猫，看着就是个会动的贴纸。现在只看三件事：
+   * 在不在干活、刚说完话没、真闲了多久。
+   */
+  function pickMotivatedAnim() {
+    const now = Date.now();
+    // 抽中同一个等于没换，画面会僵在那儿 —— 先把自己现在演的那个剔掉
+    const pickDiff = (pool) => {
+      const rest = pool.filter((n) => n !== currentAnim);
+      return pick(rest.length ? rest : pool);
+    };
+    // 干活时多数还是干活的姿势，但隔一阵也得抬头看两眼、挪挪脚。
+    // 只在"写代码/敲桌面"两帧之间来回，一眼就是张会动的贴纸。
+    if (lastWorkStatus === 'running') {
+      if (Math.random() < 0.22) return pickDiff(['东张西望', '原地漂浮踏步', '摇扇纳凉', '照镜子']);
+      return pickDiff(['写代码', '原地敲击桌面互动']);
+    }
+    // 气泡还挂着说明话没说完：吐泡泡这种"还在讲"的动作最贴身
+    if (!bubble.hidden || now - lastSaidAt < 20_000) return pickDiff(['鲸鱼吐泡泡特效', '轻快摇摆舞']);
+    // 刚干完活：庆祝一下
+    if (lastWorkDoneAt && now - lastWorkDoneAt < 40_000) return pickDiff(['工作状态-雀跃庆祝', '轻快摇摆舞']);
+    const idleFor = now - Math.max(lastWorkDoneAt, lastWorkBusyAt, bootedAt);
+    // 闲过三分钟才轮到"闲到发慌"那一组
+    if (idleFor > 3 * 60_000) return pickDiff(['超大伸懒腰', '哈欠连天', '撸猫', '照镜子']);
+    return pickDiff(['东张西望', '悠闲哼歌', '原地漂浮踏步', '三球抛接', '摇扇纳凉', '踢毽子']);
+  }
+
   const blobCache = new Map();
   let currentAnim = '';
+  /** 当前动作的基准倍速：光标压在它身上时在这个基础上再快一点（"呼吸加快"） */
+  let currentRate = 1;
+  /** 悬停时呼吸加快的比例 */
+  const HOVER_RATE = 1.15;
+  /** 被盯着看一秒半之后会换的眼神动作：轮着来，别每次都是同一个 */
+  const HOVER_LOOK_ANIMS = ['东张西望', '照镜子', '悠闲哼歌'];
   /** 换动画的令牌：连点时只让最后一次生效，避免旧请求回来把画面倒回去 */
   let animToken = 0;
+  /** 最近一次"一次性动作"（蹦一下、吓一跳）的开始时刻：别的插播要给它让路 */
+  let lastReactionAt = 0;
 
   /** 等某块视频真的能出帧（最多等 ms 毫秒，超时就先切过去，总比一直空着强） */
   function waitPlayable(v, ms = 1200) {
@@ -122,11 +240,20 @@
       if (token !== animToken) return; // 已经切到别的动作了，这次作废
       const back = vids[1 - front];
       back.loop = loop;
-      back.playbackRate = rate;
+      currentRate = rate;
+      applyRate();
       // 播完回调：睡觉三段接力靠它接下一段。另一块 buffer 上的旧回调要先清掉，
       // 否则上一段播完会把已经换掉的动作又触发一遍。
       for (const v of vids) if (v !== back) v.onended = null;
-      back.onended = typeof onEnded === 'function' ? onEnded : null;
+      /*
+       * 一次性动作播完必须有下文。
+       * 以前没传回调就停在最后一帧 —— 说句话、点一下之后，屏幕上就是个定格的姿势，
+       * 短的能卡半分钟，看着像卡死了。默认接回待机。
+       * 走位动作例外：位移由主进程按素材时长推，走完它会自己发 walkEnd。
+       */
+      const autoIdle = !loop && typeof onEnded !== 'function' && !WALK_ANIMS.includes(name);
+      if (!loop) lastReactionAt = Date.now();
+      back.onended = typeof onEnded === 'function' ? onEnded : autoIdle ? () => playAnim(IDLE_ANIM, true) : null;
       back.src = url;
       back.load();
       await waitPlayable(back);
@@ -232,6 +359,29 @@
   /** 从数组里随便挑一个 */
   const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
+  /**
+   * 语气 → 动作。宿主 /pet-brain/speak 的响应里本来就有 tone：
+   * soft（轻声细语）配温和那组，light（轻快）配雀跃那组。
+   * 以前这个字段一路扔掉了，说话归说话、动作归动作，看着像两回事。
+   */
+  const TONE_ANIM = {
+    soft: ['撸猫', '照镜子', '摇扇纳凉', '悠闲哼歌', '东张西望'],
+    light: ['点击回应-开心跃动', '工作状态-雀跃庆祝', '鲸鱼吐泡泡特效', '轻快摇摆舞'],
+  };
+
+  function animForTone(tone) {
+    const pool = TONE_ANIM[tone];
+    return pool && pool.length ? pick(pool) : '';
+  }
+
+  /** 摸头的时候说的话：被吓一跳那一档，语气别太凶 */
+  const TAP_HEAD_LINES = [
+    '哎？摸我头…',
+    '头发要乱了啦',
+    '嗯…就一下哦',
+    '嘿，痒',
+  ];
+
   /** 说话时把共享大脑配的默认表情带上（已经有了就不重复贴） */
   function withEmoji(text) {
     const emoji = state?.voice?.emoji;
@@ -250,9 +400,18 @@
    */
   function say(text, ms = 8000, emojiKey = '', opts = {}) {
     if (!text) return;
-    // 桌宠说的每一句都进会话记录：气泡和聊天面板是同一个会话的两个视图，
-    // 记在这儿，左键弹的气泡和右键开的聊天面板才连得上。
-    pushChatLine('assistant', text, opts.kind || 'local');
+    /**
+     * opts.silent：只借气泡显示一下（比如等模型回话时的「…」）。
+     * 不算"开过口"，也不进会话记录 —— 否则聊天面板里会躺着一串省略号。
+     */
+    const silent = opts.silent === true;
+    if (!silent) {
+      // 桌宠每次开口都记一下时刻：本地节流靠它，别连着说
+      lastSaidAt = Date.now();
+      // 桌宠说的每一句都进会话记录：气泡和聊天面板是同一个会话的两个视图，
+      // 记在这儿，左键弹的气泡和右键开的聊天面板才连得上。
+      pushChatLine('assistant', text, opts.kind || 'local');
+    }
     if (opts.record) {
       // 本地短句宿主那边不知道 → 补记进账本，面板里也能看到
       void api('/pet-brain/chatlog', {
@@ -265,13 +424,19 @@
         })
         .catch(() => {});
     }
-    // 菜单或面板开着的时候不弹气泡：两者都往上长，会叠在一起互相盖住
-    if (!menu.hidden || (typeof panelKind === 'string' && panelKind)) {
-      ping('say.suppressed', String(text).slice(0, 20));
-      // 但话不能丢：聊天面板开着就写进日志，没开就在徽章上留个未读提示
+    // 面板开着就没地方站气泡了：写进面板 / 在徽章上留未读，话不能丢
+    if (typeof panelKind === 'string' && panelKind) {
+      ping('say.panel', String(text).slice(0, 20));
       if (panelKind === 'chat') renderChat();
       else markUnread();
       return;
+    }
+    // 右键菜单开着不挡话：主动搭话就该跟左键点它一样直接弹出来。
+    // 以前这里连菜单开着也一起抑制掉，结果"互动了屏幕上一个字都没有"——
+    // 老大要的就是这一下弹窗。菜单收起来给气泡让位。
+    if (!menu.hidden) {
+      menu.hidden = true;
+      syncGrow();
     }
     // 说话前先站住：一边走一边冒泡，气泡跟着窗口飘，看着乱
     if (walking) stopWalk();
@@ -301,17 +466,60 @@
    * 决策全在宿主侧（共享大脑的 decideProactive），这里只负责把结果显示出来。
    */
   async function askHostSpeak(force = false, extra = {}) {
+    /*
+     * 同一时刻只放一路去要话。
+     * 主动搭话、接共享大脑的茬、点一下的反应，三条路都可能同时踩响，
+     * 结果就是两次 LLM 生成、两个气泡前后脚冒出来，一句压一句。
+     */
+    if (speakInFlight) {
+      lastSpeakNote = 'busy';
+      return null;
+    }
+    speakInFlight = true;
     try {
       const res = await api('/pet-brain/speak', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ ...extra, ...(force ? { force: true } : {}) }),
       });
-      if (res?.action !== 'speak' || !res?.text) return null;
+      if (res?.action !== 'speak' || !res?.text) {
+        // 宿主说"这轮不用说"的话，把原因留下来：排障时能看出是安静期、时间窗还是模型挂了
+        lastSpeakNote = res?.reason || 'silent';
+        return null;
+      }
+      lastSpeakNote = res?.reason || 'speak';
       return res;
     } catch (e) {
+      lastSpeakNote = 'error:' + String(e?.message || e);
       ping('speak.fail', String(e?.message || e));
       return null;
+    } finally {
+      speakInFlight = false;
+    }
+  }
+
+  /**
+   * 带"等待表演"地问宿主一句话。
+   *
+   * 模型要两三秒才回话，这中间屏幕上得有点动静，不然点下去像石沉大海。
+   * 四秒还没回来才把气泡换成「…」+ 思考动作 —— 回得快就一句都不多演，
+   * 免得本来一秒就有答案，还先闪一下省略号。十二秒兜底收起。
+   */
+  async function askWithThinking(force = true, extra = {}) {
+    lastAskThought = false;
+    const seq = reactSeq;
+    const thinkTimer = setTimeout(() => {
+      // 期间又戳了一下：这一路已经作废，别再往屏幕上贴「…」
+      if (seq !== reactSeq) return;
+      lastAskThought = true;
+      playAnim(cfg?.animations?.thinking || '工作状态-思考冒泡', true);
+      say('…', 12_000, '', { silent: true, kind: 'thinking' });
+      ping('speak.wait', 'over ' + Math.round(THINK_DELAY_MS / 1000) + 's');
+    }, THINK_DELAY_MS);
+    try {
+      return await askHostSpeak(force, extra);
+    } finally {
+      clearTimeout(thinkTimer);
     }
   }
 
@@ -329,21 +537,37 @@
    * 间隔用宿主给的 intervalMs（共享大脑的 interval × (1±jitter)）。
    */
   function scheduleChatter(delayMs = 0) {
-    const wait = delayMs || 90_000 + Math.random() * 150_000;
-    setTimeout(async () => {
-      const busy = dragging || panelKind || !bubble.hidden || menu.hidden === false || hostFollowBusy;
+    // 头一轮别等太久：默认开启的自动互动，老大重启完桌宠一会儿就该看到它冒泡
+    const wait = delayMs || (chatterStarted ? 90_000 + Math.random() * 150_000 : 45_000 + Math.random() * 45_000);
+    chatterStarted = true;
+    // 只留一条计时链：手动「打开自动互动」时会再排一次，不清掉旧的就是两套在跑
+    clearTimeout(chatterTimer);
+    chatterTimer = setTimeout(async () => {
+      const busy =
+        dragging ||
+        panelKind ||
+        !bubble.hidden ||
+        menu.hidden === false ||
+        hostFollowBusy ||
+        sleeping ||
+        baifanPhase >= 0;
       if (!quiet && !busy && state) {
         const res = await askHostSpeak(false);
         if (res?.text) {
           say(res.text, 15000, res.emoji || '', { kind: 'proactive' });
-          if (res.actions?.length) playAnim(res.actions[Math.floor(Math.random() * res.actions.length)], false);
+          // 宿主给了动作就照做，没给就按语气补一个
+          const toneAnim = res.actions?.length
+            ? res.actions[Math.floor(Math.random() * res.actions.length)]
+            : animForTone(res.tone);
+          if (toneAnim) playAnim(toneAnim, false);
           ping('speak.ok', `${res.reason}/${res.tone} ${res.text.slice(0, 24)}`);
         } else {
           ping('speak.skip', res?.reason || 'silent');
         }
         scheduleChatter(res?.intervalMs);
       } else {
-        scheduleChatter();
+        // 忙/睡着/被关掉自动互动：不硬挤，过一分钟再看
+        scheduleChatter(60_000);
       }
     }, wait);
   }
@@ -446,6 +670,16 @@
     window.petDesk.drag('move', e.screenX, e.screenY);
   });
 
+  /**
+   * 这一下点在哪儿。视频是整幅 16:9，宠物头在上三分之一左右，
+   * 用归一化高度切一刀就够分辨"摸头"和"戳身子"了。
+   */
+  function tapZone(x, y) {
+    const r = pet.getBoundingClientRect();
+    if (!r.height) return 'body';
+    return (y - r.top) / r.height < 0.34 ? 'head' : 'body';
+  }
+
   window.addEventListener('pointerup', (e) => {
     if (!dragging) return;
     const click = dragging.moved < 6 && Date.now() - dragging.t0 < 350;
@@ -454,7 +688,7 @@
     dragging = null;
     velSamples = [];
     // 落地/松手后回到待机动作（抛掷的话主进程会另外通知落地）
-    if (click) onTap();
+    if (click) onTap(tapZone(e.clientX, e.clientY));
     else if (Math.hypot(vel.vx, vel.vy) < 140) playAnim('待机呼吸休闲', true);
   });
 
@@ -504,10 +738,107 @@
     for (const v of vids) if (v) v.classList.toggle('flip', Boolean(on));
   }
 
+  // ---- 视线跟随 / 悬停 ---------------------------------------------------
+  /**
+   * 视线跟着光标走。
+   *
+   * 素材只有正面站姿，没有独立的眼动帧，所以粗调用镜像（朝哪边就翻哪边），
+   * 细调用 CSS 上的轻微位移和侧倾（见 index.html 的 .gaze-left/.gaze-right），
+   * 两层叠起来才有"她在看你"的感觉。
+   *
+   * 走路的时候让位：走位系统自己管朝向，这里再翻一次就走成倒退了。
+   */
+  function applyGaze(side) {
+    gazeSide = Number(side) || 0;
+    pet.classList.toggle('gaze-left', gazeSide < 0);
+    pet.classList.toggle('gaze-right', gazeSide > 0);
+    if (walking) return;
+    setFlip(gazeSide > 0);
+  }
+
+  /**
+   * 播速 = 当前动作的基准 × 悬停加成。
+   * 走路时不掺和：走位那套按素材时长推位移，倍速一变就成顺拐。
+   */
+  function applyRate() {
+    const rate = walking ? currentRate : cursorOver ? currentRate * HOVER_RATE : currentRate;
+    for (const v of vids) if (v) v.playbackRate = rate;
+  }
+
+  /** 主进程推过来的光标方位（只在变化时发，一次一条） */
+  function applyCursor(info) {
+    if (!info) return;
+    applyGaze(info.side);
+    const over = Boolean(info.over);
+    if (over === cursorOver) return;
+    cursorOver = over;
+    pet.classList.toggle('hover', over);
+    // 呼吸加快/恢复正常：只在悬停状态真的变化时调一次，别每帧改倍速
+    applyRate();
+    hoverSince = over ? Date.now() : 0;
+    hoverLooked = false;
+    hoverStartled = false;
+    // 只在"移进它身上"的时候报一条：来回晃悠时不必刷屏，pings 只有十几格
+    if (over) ping('cursor', `side=${gazeSide} inside=${info.inside ? 1 : 0}`);
+  }
+
+  window.petDesk.onCursor?.(applyCursor);
+
+  /**
+   * 悬停反应：盯着一秒半她会抬头看你一眼，盯到四秒会"被看毛"。
+   * 忙/睡/走/开面板的时候不插播 —— 那些时候插一脚像抽风。
+   */
+  (function hoverWatcher() {
+    setTimeout(() => {
+      try {
+        const idle =
+          cursorOver &&
+          hoverSince &&
+          !dragging &&
+          !sleeping &&
+          !walking &&
+          baifanPhase < 0 &&
+          panelKind === '' &&
+          menu.hidden &&
+          bubble.hidden;
+        if (idle) {
+          const held = Date.now() - hoverSince;
+          /*
+           * 以前这里要求"正停在待机动作"才抬头。
+           * 可动作池上线之后它基本不待机（写代码、哼歌、吐泡泡轮着来），
+           * 「盯一秒半就看你一眼」等于被自己关掉了。改成：只要没在演一次性动作就给。
+           */
+          const passive = Date.now() - lastReactionAt > 4_000;
+          if (held > 1_500 && !hoverLooked && passive) {
+            hoverLooked = true;
+            const pool = HOVER_LOOK_ANIMS.filter((n) => n !== currentAnim);
+            const look = pick(pool.length ? pool : HOVER_LOOK_ANIMS);
+            playAnim(look, true);
+            ping('hover.look', `${Math.round(held / 1000)}s ${look}`);
+          }
+          if (held > 4_000 && !hoverStartled && Date.now() - lastStartleAt > 90_000) {
+            hoverStartled = true;
+            lastStartleAt = Date.now();
+            playAnim(cfg?.animations?.surprise || '被吓一跳', false, 1, () => playAnim(IDLE_ANIM, true));
+            say(pick(['哎…你盯着我看干嘛', '怎、怎么了？我脸上有东西？', '看够没呀']), 9_000, '', {
+              record: true,
+            });
+            ping('hover.startle', Math.round(held / 1000) + 's');
+          }
+        }
+      } catch {
+        /* 悬停反应出问题不能影响主流程 */
+      }
+      hoverWatcher();
+    }, 400);
+  })();
+
   function stopWalk() {
     if (!walking) return;
     walking = false;
-    setFlip(false);
+    // 走完把朝向还给光标：别因为走过一次就把"看着你"的姿态丢掉
+    applyGaze(gazeSide);
+    applyRate();
     window.petDesk.stopWalk?.();
     playAnim(IDLE_ANIM, true);
   }
@@ -521,7 +852,8 @@
 
   window.petDesk.onWalkEnd?.((info) => {
     walking = false;
-    setFlip(false);
+    applyGaze(gazeSide);
+    applyRate();
     lastWalkAt = Date.now();
     ping('walk.end', String(info?.reason ?? ''));
     // 追饭第一段走完了，接着演后面四段
@@ -554,10 +886,12 @@
     // 素材的滑步动势是朝左的（上游提示词原文："向左侧横向移动的滑步动势"），
     // 所以往右走时镜像一次，脚步方向和位移方向才一致。
     setFlip(dx > 0);
+    applyRate();
     const v = await playAnim(name, false, WALK_PLAY.rate);
     if (!v) {
       walking = false;
-      setFlip(false);
+      applyGaze(gazeSide);
+      applyRate();
       return false;
     }
     const duration = Number.isFinite(v.duration) && v.duration > 0 ? v.duration : 10.04;
@@ -595,6 +929,8 @@
   // 中间那段必须 loop=true 播（上游要求循环段首尾帧完全相同，否则循环处会跳）。
   const SLEEP = { start: '睡觉-开始', loop: '睡觉-循环', end: '睡觉-起来', maxMs: 45_000, menu: '😴 睡一觉' };
   const SLEEP_CLIPS = new Set([SLEEP.start, SLEEP.loop, SLEEP.end]);
+  /** 午后小憩趴多久：十分钟就够，睡久了反而糊 */
+  const NAP_MS = 10 * 60_000;
   let sleeping = false;
   let sleepPhase = '';
   let sleepTimer = 0;
@@ -624,24 +960,26 @@
 
   /**
    * 开始睡觉。auto=true 是夜里自动睡，睡到早上 7 点；
+   * nap=true 是午后小憩，只趴 NAP_MS（十分钟）；
    * 手动睡只睡 SLEEP.maxMs（45 秒），免得手动点一下就睡死过去。
    */
-  async function startSleep(auto = false) {
+  async function startSleep(auto = false, nap = false) {
     if (sleeping) return false;
     if (!animTable) return false;
     if (walking) stopWalk();
     sleeping = true;
     sleepPhase = 'start';
     clearTimeout(sleepTimer);
-    ping('sleep.start', auto ? 'auto' : 'manual');
-    if (auto) say('困了，先眯一会儿…', 4000, '', { record: true });
+    ping('sleep.start', nap ? 'nap' : auto ? 'auto' : 'manual');
+    if (nap) say('吃过了，我趴十分钟', 5000, '', { record: true });
+    else if (auto) say('困了，先眯一会儿…', 4000, '', { record: true });
     const ok = await playAnim(SLEEP.start, false, 1, () => sleepLoop());
     if (!ok) {
       sleeping = false;
       sleepPhase = '';
       return false;
     }
-    sleepTimer = setTimeout(() => wakeUp(), auto ? msUntilHour(7) : SLEEP.maxMs);
+    sleepTimer = setTimeout(() => wakeUp(), nap ? NAP_MS : auto ? msUntilHour(7) : SLEEP.maxMs);
     paintBadge();
     return true;
   }
@@ -669,22 +1007,71 @@
     });
   }
 
-  /** 夜里自动睡：23 点到早上 6 点，闲着没事就睡 */
+  /**
+   * 自动睡：夜里 23 点到早上 6 点，闲着就睡；午后 12:30-13:30 趴十分钟。
+   * 夜里老大还在干活就不睡 —— 它先倒下不合适，那是陪着的时候（见 maybeNightYawn）。
+   */
   function maybeAutoSleep() {
     if (sleeping) return;
+    const now = new Date();
+    const h = now.getHours();
+    const mi = now.getMinutes();
+    const night = h >= 23 || h < 6;
+    const napWindow = (h === 12 && mi >= 30) || (h === 13 && mi < 30);
+    if (!night && !napWindow) return;
+    if (night && lastWorkStatus === 'running') return;
+    if (dragging || walking || quiet || panelKind || !bubble.hidden) return;
+    if (now.getTime() - lastSleepAt < 30 * 60_000) return;
+    if (napWindow && !night) {
+      const day = now.toDateString();
+      if (napDay === day) return; // 一天趴一次就够
+      napDay = day;
+      ping('sleep.nap', 'afternoon');
+      startSleep(false, true);
+      return;
+    }
+    startSleep(true);
+  }
+
+  /**
+   * 连着干活满四十五分钟就伸个懒腰提醒一句。
+   * 走本地短句不走模型：提醒这事儿不该等两秒生成。
+   */
+  function maybeStretchBreak() {
+    if (!workSince || lastWorkStatus !== 'running') return;
+    const held = Date.now() - workSince;
+    if (held < 45 * 60_000) return;
+    if (Date.now() - lastStretchAt < 45 * 60_000) return;
+    if (dragging || walking || sleeping || baifanPhase >= 0 || panelKind || !bubble.hidden || quiet) return;
+    lastStretchAt = Date.now();
+    playAnim('超大伸懒腰', false, 1, () => playAnim(IDLE_ANIM, true));
+    say(pick(['连着四十五分钟了，起来动动？', '坐太久了，肩膀该僵了', '喝口水吧，别干成石头']), 10_000, '', {
+      record: true,
+    });
+    ping('break.stretch', Math.round(held / 60_000) + 'min');
+  }
+
+  /** 深夜陪同：老大还在干，它就不睡，隔一阵打个哈欠表示还在 */
+  function maybeNightYawn() {
     const h = new Date().getHours();
     if (!(h >= 23 || h < 6)) return;
-    if (dragging || walking || quiet || panelKind || !bubble.hidden || lastWorkStatus === 'running') return;
-    if (Date.now() - lastSleepAt < 30 * 60_000) return;
-    startSleep(true);
+    if (lastWorkStatus !== 'running') return;
+    if (sleeping || dragging || walking || baifanPhase >= 0 || panelKind || !bubble.hidden || quiet) return;
+    if (Date.now() - lastNightYawnAt < 15 * 60_000) return;
+    lastNightYawnAt = Date.now();
+    playAnim('哈欠连天', false, 1, () => playAnim(IDLE_ANIM, true));
+    say(pick(['哈……你还没睡啊', '这么晚了，我陪着你', '眼皮重了…但你还在干']), 8_000, '', { record: true });
+    ping('night.yawn', new Date().toTimeString().slice(0, 5));
   }
 
   (function sleepWatcher() {
     setTimeout(() => {
       try {
         maybeAutoSleep();
+        maybeStretchBreak();
+        maybeNightYawn();
       } catch {
-        /* 自动入睡失败也别影响主流程 */
+        /* 作息相关的动作失败也别影响主流程 */
       }
       sleepWatcher();
     }, 60_000);
@@ -745,21 +1132,66 @@
   }
 
   // ---- 交互 -------------------------------------------------------------
-  function onTap() {
+  function onTap(zone = 'body') {
     menu.hidden = true;
+    // 走着被点：先站住，不然她一边滑行一边演点击回应，像在溜冰
+    if (walking) stopWalk();
     // 睡着的时候点一下就是叫醒，别搭话
     if (sleeping) {
       wakeUp();
       return;
     }
-    // 先给一句本地短句，点了立刻有反应（模型要两秒多，等着会以为没点中）
-    say(withEmoji(pick(BAND_LINES[bandId()] || BAND_LINES.unknown)), 9000, '', { record: true });
+    const now = Date.now();
+    // 这一戳的批次号：比它更新的点击会让这一路回来的话作废
+    const mySeq = ++reactSeq;
+    // 连戳三下：同一个 1.6 秒窗口里数到第三下就翻脸，别一直戳
+    if (now - tapWindowAt > 1_600) tapCount = 0;
+    tapWindowAt = now;
+    tapCount += 1;
+    if (tapCount >= 3) {
+      tapCount = 0;
+      say(withEmoji(pick(['别戳了别戳了', '哎哟，连着戳我干嘛', '手痒啊你'])), 9_000, '', { record: true });
+      playAnim(cfg?.animations?.click?.[3] || '点击回应-傲娇生气', false, 1, () => playAnim(IDLE_ANIM, true));
+      ping('tap.poke', 'triple');
+      return;
+    }
+    if (zone === 'head') {
+      // 摸头一档：动作是吓一跳，话得软。
+      // 这一档到此为止 —— 摸头要的是即时的反应，别等两秒后用模型那句盖掉，
+      // 那样老大摸的是头，听到的却是"三点半了"这种话题词，驴唇不对马嘴。
+      say(withEmoji(pick(TAP_HEAD_LINES)), 9_000, '', { record: true });
+      playAnim(cfg?.animations?.surprise || '被吓一跳', false, 1, () => playAnim(IDLE_ANIM, true));
+      ping('tap.head', 'surprise');
+      return;
+    }
+    // 点身子：先给一句本地短句，点了立刻有反应（模型要两秒多，等着会以为没点中）
+    say(withEmoji(pick(BAND_LINES[bandId()] || BAND_LINES.unknown)), 9_000, '', { record: true });
     playAnim(actionOf(state), false);
+    ping('tap.body', 'click');
+    /*
+     * 连点别每次都去要一句。
+     * 本地短句已经给过反应了，三秒内的第二第三下再各生成一次，纯属烧钱，
+     * 而且两句话前后脚冒出来会互相打架。
+     */
+    if (now - lastTapAskAt <= 2_500) {
+      ping('tap.speak.skip', 'debounce');
+      return;
+    }
+    lastTapAskAt = now;
     // 再让宿主按共享大脑的调子重新说一句，来了就替换掉。
-    // 这里不再跟着换动作 —— 上面已经动过一次，模型回来再换就是同一次点击换两回，看着闪。
-    askHostSpeak(true).then((res) => {
+    // 四秒不回就自己先演「…」+ 思考动作（见 askWithThinking）。
+    askWithThinking(true).then((res) => {
+      if (mySeq !== reactSeq) return;
       if (!res?.text) return;
-      say(res.text, 15000, res.emoji || '', { kind: 'proactive' });
+      // 只有真的等过（已经切到思考动作）才按语气再换一次动作；
+      // 回得快就保持刚才那一下 —— 同一次点击连换两回，看着闪。
+      // 等过又没有对应语气的动作，就先回待机，别顶着「？」听人说话。
+      const toneAnim = animForTone(res.tone);
+      if (lastAskThought) {
+        if (toneAnim) playAnim(toneAnim, false);
+        else playAnim(IDLE_ANIM, true);
+      }
+      say(res.text, 15_000, res.emoji || '', { kind: 'proactive' });
       ping('tap.speak', res.text.slice(0, 30));
     });
   }
@@ -774,8 +1206,10 @@
   );
 
   pet.addEventListener('dblclick', () => {
-    say('嘿嘿，别挠了', 8000, '', { record: true });
-    playAnim(cfg?.animations?.click?.[0] || '点击回应-开心跃动', false);
+    if (sleeping) return;
+    say('拆礼物？是给我的吗', 8_000, '', { record: true });
+    playAnim(cfg?.animations?.gift || '拆礼物', false, 1, () => playAnim(IDLE_ANIM, true));
+    ping('tap.gift', 'dblclick');
   });
 
   pet.addEventListener('contextmenu', (e) => {
@@ -807,7 +1241,7 @@
       ['🎬 换个动作', () => openPanel('actions')],
       ['🍚 去吃饭', () => startBaifan()],
       [sleeping ? '☀️ 叫醒它' : '😴 睡一觉', () => (sleeping ? wakeUp() : startSleep())],
-      [quiet ? '🔊 多说点' : '🔇 安静点', () => toggleQuiet()],
+      [quiet ? '🔔 打开自动互动' : '🔕 关掉自动互动', () => toggleQuiet()],
       null,
       ['✕ 关掉桌面助手', () => closeByUser()],
     ];
@@ -867,9 +1301,16 @@
     window.petDesk.quit();
   }
 
-  function toggleQuiet() {    quiet = !quiet;
-    localStorage.setItem('pet-desk:quiet', quiet ? '1' : '0');
+  function toggleQuiet() {
+    quiet = !quiet;
+    try {
+      localStorage.setItem(QUIET_KEY, quiet ? '1' : '0');
+    } catch {
+      /* localStorage 不可用：这次会话里生效就行 */
+    }
     say(quiet ? '好，那我少说点' : '行，那我多说点', 8000, '', { record: true });
+    // 刚把自动互动打开：别等下一轮随机间隔，马上试一次
+    if (!quiet) scheduleChatter(5_000);
   }
 
   // ---- 面板：聊天 / 余额 / 心情 ------------------------------------------
@@ -1264,11 +1705,16 @@
       const busyScene = sleeping || baifanPhase >= 0; // 睡觉/追饭时不插播工作动作
       if (w && w.status !== lastWorkStatus) {
         if (w.status === 'running' && w.action) {
+          // 记住这轮活儿的起点：满四十五分钟要提醒起来动动
+          if (!workSince) workSince = Date.now();
+          lastWorkBusyAt = Date.now();
           if (!busyScene) {
             playAnim(w.action, true);
             ping('work.running', w.action);
           }
         } else if (lastWorkStatus === 'running') {
+          workSince = 0;
+          lastWorkDoneAt = Date.now();
           if (!busyScene) {
             playAnim('待机呼吸休闲', true);
             ping('work.idle', 'turns=' + (w.turns ?? 0));
@@ -1276,16 +1722,19 @@
           if (!quiet && !panelKind && bubble.hidden) say('这轮干完啦，歇会儿？', 9000, '', { record: true });
         }
         lastWorkStatus = w.status;
+      } else if (w && w.status === 'running') {
+        lastWorkBusyAt = Date.now();
       }
-      // 情绪动作：闲时才换，而且别换太勤（每 2 秒轮询一次，换太勤看着抽搐）
-      // 老大在忙的时候不插播情绪动作 —— 专心干活，别打扰。
-      // 睡觉 / 追饭的时候也别插播 —— 那会把正在进行的一整套动作打断。
-      if (!dragging && !sleeping && baifanPhase < 0 && lastWorkStatus !== 'running' && state?.actions?.length) {
-        const now = Date.now();
-        if (now - lastActionSwap > 14000) {
-          lastActionSwap = now;
-          const pool = state.actions;
-          playAnim(pool[Math.floor(Math.random() * pool.length)], true);
+      // 有动机的动作池：别在忙、睡着、追饭、走着、开着面板的时候插播。
+      // 间隔改成 30~70 秒随机 —— 以前固定 14 秒，节奏太像机器。
+      if (!dragging && !sleeping && baifanPhase < 0 && !walking && panelKind === '') {
+        const nowSwap = Date.now();
+        const gap = 30_000 + Math.random() * 40_000;
+        // 正在演一次性动作（蹦一下、吓一跳）就别打断：等它自己接回待机
+        if (nowSwap - lastActionSwap > gap && nowSwap - lastReactionAt > 6_000) {
+          lastActionSwap = nowSwap;
+          const next = pickMotivatedAnim();
+          if (next) playAnim(next, true);
         }
       }
 
@@ -1294,15 +1743,23 @@
       // 额度用完、隔很久才说一句，桌宠永远等不到那个窗口。
       // 现在宿主那边记着"接到哪一条"，这边只看"有没有新的"。
       const h = state?.host;
+      const now = Date.now();
       if (
         h &&
         h.at &&
         h.at > (h.seenAt ?? 0) &&
+        h.at > hostFollowSeenAt &&
         !quiet &&
         !dragging &&
         !sleeping &&
         !walking &&
-        !hostFollowBusy
+        !hostFollowBusy &&
+        // 菜单/面板开着说明老大正在动手操作，这时候抢一句会把菜单顶掉。
+        // 让位，等这一轮操作完了再说 —— 反正 h.at 还留着，下一轮轮询还能接。
+        menu.hidden &&
+        panelKind === '' &&
+        now >= hostFollowRetryAt &&
+        now - lastSaidAt > HOST_FOLLOW_GAP_MS
       ) {
         hostFollowBusy = true;
         void api('/pet-brain/speak', {
@@ -1312,13 +1769,23 @@
         })
           .then((res) => {
             if (res?.action === 'speak' && res?.text) {
+              // 这一条接过了，记住：别再接一遍
+              hostFollowSeenAt = h.at;
+              hostFollowRetryAt = 0;
+              // 跟上语气再动一下：以前光冒泡不动，说话的人像贴纸
+              const toneAnim = animForTone(res.tone);
+              if (toneAnim) playAnim(toneAnim, false);
               say(res.text, 15000, res.emoji || '', { kind: 'proactive' });
               ping('host.follow', `${res.reason} ${res.text.slice(0, 24)}`);
             } else {
+              hostFollowRetryAt = now + FOLLOW_RETRY_MS;
               ping('host.follow.skip', res?.reason || 'silent');
             }
           })
-          .catch((e) => ping('host.follow.fail', String(e?.message || e)))
+          .catch((e) => {
+            hostFollowRetryAt = now + FOLLOW_RETRY_MS;
+            ping('host.follow.fail', String(e?.message || e));
+          })
           .finally(() => {
             hostFollowBusy = false;
           });
@@ -1329,7 +1796,8 @@
   }
 
   async function boot() {
-    ping('boot');
+    // 顺带把自动互动的开关状态报上来：排障时一眼看出是不是被"关掉自动互动"摁住了
+    ping('boot', quiet ? 'auto=off' : 'auto=on');
     try {
       const env = await window.petDesk.env();
       if (env?.host) HOST = env.host;
@@ -1404,9 +1872,9 @@
         await wait(1800);
         out.push('refresh clicked, stats=' + infoEl.querySelectorAll('.stat').length);
       }
-      await clickItem('安静');
+      await clickItem('自动互动');
       out.push('quiet=' + quiet);
-      await clickItem('安静');
+      await clickItem('自动互动');
       out.push('quietBack=' + quiet);
       await clickItem('动作');
       out.push('actions panel=' + panelKind + ' btns=' + $('actions').querySelectorAll('.act').length);
@@ -1443,6 +1911,95 @@
      * 抛掷物理自检：合成一串指针事件快速拖动再松手，
      * 看主进程有没有真的把窗口甩出去、落地有没有回弹通知。
      */
+    /**
+     * 视线/悬停自检：直接喂一条光标消息进去，返回朝向、class 和呼吸倍速。
+     * 不用真去挪鼠标 —— 截图验证的时候鼠标在哪儿不好控制。
+     */
+    cursor: async (side = 1, over = false) => {
+      applyCursor({ side, over, inside: true, nx: side, ny: 0 });
+      await new Promise((r) => setTimeout(r, 500));
+      const v = vids[front];
+      return (
+        'side=' +
+        gazeSide +
+        ' flip=' +
+        vids.some((x) => x && x.classList.contains('flip')) +
+        ' hover=' +
+        pet.classList.contains('hover') +
+        ' gaze=' +
+        (pet.classList.contains('gaze-left') ? 'left' : pet.classList.contains('gaze-right') ? 'right' : 'front') +
+        ' rate=' +
+        (v ? v.playbackRate.toFixed(2) : '?') +
+        ' onCursor=' +
+        typeof window.petDesk.onCursor
+      );
+    },
+
+    /** 现在演的是哪个动作（验证"一次性动作播完有没有接回待机"用） */
+    animNow: () => 'anim=' + currentAnim + ' rate=' + currentRate,
+
+    /** 姿势自检：先把画面钉在某个非待机动作上，后面验"悬停抬头"才不会被待机态掩盖 */
+    pose: async (name = '写代码') => {
+      await playAnim(name, true);
+      await new Promise((r) => setTimeout(r, 400));
+      return 'anim=' + currentAnim;
+    },
+
+    /** 点法自检：直接走一次点击（head/body），看用了哪个动作、气泡有没有出来 */
+    tap: async (zone = 'body') => {
+      const before = lastAnimName;
+      onTap(zone);
+      await new Promise((r) => setTimeout(r, 1200));
+      return `zone=${zone} anim=${lastAnimName} was=${before} bubble=${bubble.hidden ? 'hidden' : 'shown'}`;
+    },
+
+    /** 连戳三下：验证不耐烦那一档 */
+    poke: async () => {
+      onTap('body');
+      await new Promise((r) => setTimeout(r, 260));
+      onTap('body');
+      await new Promise((r) => setTimeout(r, 260));
+      onTap('body');
+      await new Promise((r) => setTimeout(r, 900));
+      return 'anim=' + lastAnimName + ' taps=' + tapCount;
+    },
+
+    /** 动机池自检：只算出"此刻会挑哪个动作"，不真的播 */
+    motive: () =>
+      'next=' +
+      pickMotivatedAnim() +
+      ' busy=' +
+      lastWorkStatus +
+      ' idleMs=' +
+      (Date.now() - Math.max(lastWorkDoneAt, lastWorkBusyAt, bootedAt)),
+
+    /**
+     * 作息自检：把"连轴转"的计时拨到 46 分钟，看会不会真的伸懒腰提醒。
+     * 不然这条要等满四十五分钟才有机会验证。
+     */
+    stretch: () => {
+      workSince = Date.now() - 46 * 60_000;
+      lastStretchAt = 0;
+      lastWorkStatus = 'running';
+      bubble.hidden = true;
+      menu.hidden = true;
+      const before = lastAnimName;
+      maybeStretchBreak();
+      return 'anim=' + lastAnimName + ' was=' + before;
+    },
+
+    /**
+     * 等待期自检：把"多久演省略号"压到 300ms，戳一下就能看到「…」+ 思考动作。
+     * 正常是四秒，靠真等一小时才撞得上不合适。
+     */
+    think: async () => {
+      THINK_DELAY_MS = 300;
+      onTap('body');
+      await new Promise((r) => setTimeout(r, 1_500));
+      const text = String(bubble.textContent || '').trim().slice(0, 24);
+      return 'anim=' + lastAnimName + ' bubble=' + (bubble.hidden ? 'hidden' : 'shown') + ' text=' + text;
+    },
+
     throwTest: async () => {
       lastLand = null;
       const r = pet.getBoundingClientRect();

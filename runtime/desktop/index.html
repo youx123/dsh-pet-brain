@@ -60,9 +60,43 @@
       .petvideo.show {
         opacity: 1;
       }
-      /* 向左走时镜像一下，看着像真的换了方向 */
+      /**
+       * 视线跟随 + 悬停（灵动包）。
+       *
+       * 素材只有正面站姿，没有独立的眼动帧，所以只能"骗"：
+       * 光标在哪边，画面就往那边挪几个像素（幅度很小，大了像站不稳）；
+       * 鼠标压在它身上时整体放大 2%，呼吸也跟着快一点（倍速在 renderer 里调）。
+       *
+       * 三个效果都要跟 .flip 叠在一起，所以统一走 CSS 变量拼 transform，
+       * 别写成三条会互相覆盖的规则。变换只加在视频上 —— 气泡/菜单/面板
+       * 是 #pet 的子元素，动它们的参考系会把浮层一起挪歪。
+       */
+      .petvideo {
+        --flip: 1;
+        --gaze-x: 0px;
+        --hover-s: 1;
+        transform: translateX(var(--gaze-x)) scaleX(var(--flip)) scale(var(--hover-s));
+        transition: transform 260ms ease-out;
+      }
       .petvideo.flip {
-        transform: scaleX(-1);
+        --flip: -1;
+      }
+      #pet.gaze-left .petvideo {
+        --gaze-x: -5px;
+      }
+      #pet.gaze-right .petvideo {
+        --gaze-x: 5px;
+      }
+      #pet.hover .petvideo {
+        --hover-s: 1.02;
+      }
+      /* 悬停时徽章浮起来一点，像是"抬头看你" */
+      #badge {
+        transition: transform 200ms ease-out, box-shadow 200ms ease-out;
+      }
+      #pet.hover #badge {
+        transform: translateX(-50%) translateY(-3px);
+        box-shadow: 0 5px 16px rgba(0, 0, 0, 0.18);
       }
       /* 面板底板 */
       .card {
