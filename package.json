@@ -1,6 +1,6 @@
 {
   "name": "dsh-pet-brain",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "有大脑的桌宠：人设、心情和记忆全部来自 dsh-shared-brain，心情档位驱动动作，每轮对话现场召回记忆拼 system prompt。",
   "type": "module",
   "main": "lib/index.js",
