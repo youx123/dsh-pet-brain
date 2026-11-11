@@ -13,7 +13,7 @@
 | 人设 | 插件配置里手写 | 共享大脑 `persona.json`（唯一源头） |
 | 情绪 | 无 | 共享大脑 `emotion.json` 的 mood + 七维 |
 | 记忆 | 本地 5 轮对话 | 共享大脑 `memory.json`，按当轮输入实时召回，**聊完还会写回去** |
-| 主动搭话 | 自己写死的定时器 | **共享大脑的决策层算**（安静期/每日上限/均匀铺开/关心/分享），档位和它一致 |
+| 主动搭话 | 自己写死的定时器 | **共享大脑的决策层算**（安静期/每日上限/均匀铺开/关心/分享），档位和它一致；你刚说完话的 5 分钟里两边都闭嘴 |
 | 工作状态 | 自己判断 | 直接读宿主的 `ctx.agents.list()`，你在干活它就换动作 |
 | 表现 | 动画池大、桌面 Helper、余额 | 同上，但只做一只：462px 固定体型 + 心情徽章 + 气泡 + 面板 |
 | 素材 | 自建 | 复用它的 44 个 webm（MIT，见 NOTICE.md） |
@@ -52,6 +52,7 @@ dsh plugin add <克隆下来的目录绝对路径>
 读盘带 `mtime + size` 缓存，文件没动就不重复解析。
 
 心情取 `updatedAt` 最新的那条会话状态（多会话并行时以最近活动为准）。
+超过 6 小时没更新会算「旧了」（可信度减半），超过 24 小时直接当没有，免得两天前的情绪一直演。
 需要固定跟某只宠物绑一个会话，可以在 `/pet-brain/state?session=<id>` 里指定。
 
 ## HTTP 端点（仅 loopback）
@@ -66,6 +67,12 @@ dsh plugin add <克隆下来的目录绝对路径>
 | POST | `/pet-brain/speak` | 走完整决策链：决策 → 生成 → 回写每日额度 → `{text, emoji, actions}`；`{force:true}` 强制开口 |
 | GET | `/pet-brain/work` | 当前有几个会话在跑、桌宠该配什么工作动作 |
 | GET | `/pet-brain/anim/<名>.webm` | 动画素材（白名单，防路径穿越） |
+| GET / POST | `/pet-brain/ping` | GET 返回存活与版本；POST 收桌面助手的分阶段自检记录（`{stage, detail}`），排障用 |
+| POST | `/pet-brain/archive` | `{ids:string[]}` 归档多余会话（桌宠只留一个，调试后清场用） |
+| GET | `/pet-brain/session` | 桌宠那个会话现在长什么样（最后一条用户话、最后一条回复），排障用 |
+| GET | `/pet-brain/env` | 宿主运行时探测：是不是 Electron 主进程、能不能拿到 `BrowserWindow` |
+| GET / POST | `/pet-brain/desktop` | 桌面助手状态；POST `{action:'start'\|'stop'\|'restart'}` 起停独立窗口 |
+| GET / POST | `/pet-brain/chatlog` | 桌宠自己的会话账本（气泡、聊天面板、主动搭话同一份）；POST 追加一条 |
 
 ## 心情档位 → 动作
 
@@ -133,7 +140,7 @@ dsh plugin add <克隆下来的目录绝对路径>
 
 | 触发词 | 落哪个模块 | 权重 | 生命周期 |
 | --- | --- | --- | --- |
-| 不许/不能/别再/禁止/必须… | `bottomline` 底线 | 0.9 | 永久 |
+| 以「不许/别/禁止…」开头，或「必须/一定要/只能 + 动作」 | `bottomline` 底线 | 0.9 | 永久 |
 | 喜欢/爱你/生气/难过… | `emotion` 情感 | 0.72 | 永久 |
 | 我喜欢/我讨厌/以后都/每次都… | `instinct` 本能 | 0.68 | 永久 |
 | 其它 | `cognition` 认知 | 0.55 | 临时 7 天 |
