@@ -695,6 +695,9 @@ let THINK_DELAY_MS = 4_000;
     // 只要菜单和面板 —— 气泡是不可交互的，算进热区反而挡桌面
     add(menu);
     add(panel);
+    // 2026-11-11：徽章在宠物下沿 -22px（BADGE_SPACE 里），不在宠物热区里，
+    // 不单独上报的话点击永远穿透到桌面，心情/未读入口等于没有。
+    add(badge);
     const key = JSON.stringify(zones);
     if (key === lastZonesKey) return;
     lastZonesKey = key;
@@ -1349,6 +1352,17 @@ let THINK_DELAY_MS = 4_000;
     }
   }, false);
 
+  // 2026-11-11：点面板外面也关面板（以前只有 ✕ 和输入框里的 Esc）
+  window.addEventListener('pointerdown', (e) => {
+    if (panel.hidden) return;
+    if (panel.contains(e.target)) return;
+    if (e.target && e.target.closest && e.target.closest('#badge')) return;
+    closePanel();
+  }, false);
+
+  // 关掉是不可逆的（宿主会记 closedByUser，下次启动不再拉起），所以点一次只是「上膛」
+  let closeArmed = false;
+
   function buildMenu() {
     const items = [
       ['💬 聊两句', () => openPanel('chat')],
@@ -1358,8 +1372,21 @@ let THINK_DELAY_MS = 4_000;
       ['🍚 去吃饭', () => startBaifan()],
       [sleeping ? '☀️ 叫醒它' : '😴 睡一觉', () => (sleeping ? wakeUp() : startSleep())],
       [quiet ? '🔔 打开自动互动' : '🔕 关掉自动互动', () => toggleQuiet()],
+      // 2026-11-11：找不到 / 跑到屏幕外面时的手动兜底
+      ['🎯 重新居中', () => window.petDesk.recenter?.()],
       null,
-      ['✕ 关掉桌面助手', () => closeByUser()],
+      [
+        closeArmed ? '✕ 再点一次就关掉' : '✕ 关掉桌面助手',
+        () => {
+          if (!closeArmed) {
+            closeArmed = true;
+            buildMenu();
+            syncGrow();
+            return;
+          }
+          closeByUser();
+        },
+      ],
     ];
     menu.innerHTML = '';
     for (const it of items) {
@@ -1537,6 +1564,22 @@ let THINK_DELAY_MS = 4_000;
     if (walking) stopWalk();
     panelKind = kind;
     panel.hidden = false;
+    /*
+     * 2026-11-11（P0）：面板是从宠物上沿向上长进 HUD 预留区的，可用高度就是
+     * 「宠物顶边到窗口顶」这一段。以前 #panel/#actions 写死 588/460，动作面板
+     * 实高约 513，多出来的顶部跑出窗口 —— 标题栏和 ✕ 都点不到，只能重启。
+     * 现在按真实可用空间算，超了就在面板内部滚。
+     */
+    try {
+      const petRect = pet.getBoundingClientRect();
+      const avail = Math.max(180, Math.round(petRect.top - 8));
+      panel.style.maxHeight = `${avail}px`;
+      panel.style.overflowY = 'auto';
+      const actionsEl = $('actions');
+      if (actionsEl) actionsEl.style.maxHeight = `${Math.max(140, avail - 96)}px`;
+    } catch {
+      /* 量不到就退回 CSS 默认值 */
+    }
     panelName.textContent =
       kind === 'chat' ? '聊天' : kind === 'usage' ? 'DeepSeek 余额' : kind === 'actions' ? '换个动作' : '心情';
     logEl.hidden = kind !== 'chat';

@@ -46,6 +46,8 @@ contextBridge.exposeInMainWorld('petDesk', {
   /** 保留兼容：渲染端启动时会上报一次宽度。窗口尺寸已固定，主进程收到同值会直接忽略 */
   resize: (width) => ipcRenderer.send('pet:resize', width),
   quit: () => ipcRenderer.send('pet:quit'),
+  /** 把桌宠挪回光标所在屏幕的右下角（找不到 / 掉到屏幕外时的兜底） */
+  recenter: () => ipcRenderer.send('pet:recenter'),
   env: () => ipcRenderer.invoke('pet:env'),
   /** 落地回调：主进程物理算出撞击强度时通知渲染端做压扁动画 */
   // 每次注册都返回退订函数：以前重复注册会堆一堆 listener，事件来一次回调 N 次

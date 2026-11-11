@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
@@ -193,7 +193,8 @@
         grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 6px;
         /* 动作太多时在列表内部滚动，别把面板撑破、也别让 flex 挤压行高 */
-        max-height: 460px;
+        /* 2026-11-11：460 太高，动作面板会顶出 HUD 预留区；打开时 JS 会按真实空间再量一次 */
+        max-height: 240px;
         overflow-y: auto;
         padding-right: 2px;
         align-content: start;
@@ -317,7 +318,8 @@
         z-index: 2;
         /* 窗口尺寸固定（宠物 + 上方 600px HUD 预留区），面板长在这个预留区里。
            不能用 vh：预留区高度跟窗口绑死，vh 会自我压缩。588 = 600 预留 - 12 间距 */
-        max-height: 588px;
+        /* 2026-11-11：同理，588 会超出预留区，默认压低，打开时 JS 按真实空间覆盖 */
+        max-height: 300px;
         overflow: hidden;
       }
       #panel[hidden] {

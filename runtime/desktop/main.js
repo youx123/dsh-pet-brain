@@ -220,12 +220,77 @@ function movePetTo(x, y) {
     log('movePetTo 忽略非法坐标 ' + x + ',' + y);
     return;
   }
-  const nx = Math.round(x);
-  const ny = Math.round(y);
+  // 2026-11-11（P0）：拖拽/抛掷不能把人扔到屏幕外面去。以前这里不夹边界，
+  // 慢速拖过边缘或拔掉副屏之后窗口就留在可视区外，进程还活着、客户端那只
+  // 又被藏起来 —— 两只都看不见，只能重启宿主。
+  const safe = clampToDisplay(Math.round(x), Math.round(y));
+  const nx = safe.x;
+  const ny = safe.y;
   win.setPosition(nx, ny);
   curBounds.x = nx;
   curBounds.y = ny;
   requestedBounds = `${nx},${ny},${curBounds.width},${curBounds.height}`;
+}
+
+/** 窗口（或某个矩形）落在哪块屏幕上。多屏时别一律拿主屏。 */
+function displayOf(bounds = curBounds) {
+  try {
+    const point = {
+      x: Math.round(bounds.x + bounds.width / 2),
+      y: Math.round(bounds.y + bounds.height / 2),
+    };
+    return screen.getDisplayNearestPoint(point);
+  } catch {
+    return screen.getPrimaryDisplay();
+  }
+}
+
+/**
+ * 把窗口夹回屏幕可见区域。
+ * 允许横向探出去一半（贴边时宠物能露出半个身子），纵向留出徽章和至少 40% 的高度。
+ */
+function clampToDisplay(x, y, width = curBounds.width, height = curBounds.height) {
+  const area = displayOf({ x, y, width, height }).workArea;
+  const half = Math.round(width * 0.5);
+  const keep = Math.round(height * 0.4);
+  const minX = area.x - half;
+  const maxX = area.x + area.width - half;
+  const minY = area.y - Math.round(height * 0.2);
+  const maxY = area.y + area.height - BADGE_SPACE - keep;
+  return {
+    x: Math.min(maxX, Math.max(minX, Math.round(x))),
+    y: Math.min(maxY, Math.max(minY, Math.round(y))),
+  };
+}
+
+/** 这个矩形在所有显示器上露出来的面积（平方像素）。 */
+function visibleAreaOf(bounds) {
+  let total = 0;
+  for (const display of screen.getAllDisplays()) {
+    const r = display.workArea;
+    const w = Math.min(bounds.x + bounds.width, r.x + r.width) - Math.max(bounds.x, r.x);
+    const h = Math.min(bounds.y + bounds.height, r.y + r.height) - Math.max(bounds.y, r.y);
+    if (w > 0 && h > 0) total += w * h;
+  }
+  return total;
+}
+
+/** 把桌宠放回光标所在屏幕的右下角。 */
+function recenterPet(reason = '') {
+  if (!win || win.isDestroyed()) return;
+  const display = (() => {
+    try {
+      return screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+    } catch {
+      return screen.getPrimaryDisplay();
+    }
+  })();
+  const area = display.workArea;
+  const { width, height } = win.getBounds();
+  const x = Math.max(area.x, area.x + area.width - width - 24);
+  const y = Math.max(area.y, area.y + area.height - height - 24);
+  movePetTo(x, y);
+  log(`桌宠回中${reason ? '（' + reason + '）' : ''} → ${x},${y}`);
 }
 
 /**
@@ -241,7 +306,13 @@ const HUD_MIN = 120;
 /** 真正需要的高度：气泡 176 / 右键菜单 250 / 面板最高 300，留一点余量就够 */
 const HUD_WANT = 320;
 function hudSpace() {
-  const area = screen.getPrimaryDisplay().workArea;
+  // 用光标所在的那块屏幕算，多屏时不至于按主屏高度把窗口开成奇怪的比例
+  let area;
+  try {
+    area = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea;
+  } catch {
+    area = screen.getPrimaryDisplay().workArea;
+  }
   // 之前是"屏幕剩多少给多少"（最高 600），窗口一大半是空的，手上没反应也挡桌面
   return Math.max(HUD_MIN, Math.min(HUD_WANT, Math.round(area.height * 0.42)));
 }
@@ -699,6 +770,11 @@ function fromPet(e) {
   return !!win && !win.isDestroyed() && e && e.sender === win.webContents;
 }
 
+ipcMain.on('pet:recenter', (e) => {
+  if (!fromPet(e)) return;
+  recenterPet('菜单点了重新居中');
+});
+
 ipcMain.on('pet:hotzones', (_e, list) => {
   if (!fromPet(_e)) return;
   // 坐标必须都是有限数：NaN/Infinity 混进来，命中判定会静默失灵，
@@ -801,7 +877,8 @@ function physTick() {
   if (dt > 0.1) dt = 0.1;
 
   const b = win.getBounds();
-  const area = screen.getPrimaryDisplay().workArea;
+  // 2026-11-11：物理边界跟着窗口所在的屏幕走，副屏上不会一步跳回主屏
+  const area = displayOf(b).workArea;
 
   phys.vy += PHYS.GRAVITY * dt;
   phys.vx *= PHYS.AIR_DRAG;
@@ -906,7 +983,8 @@ function walkTick() {
     return;
   }
   const b = win.getBounds();
-  const area = screen.getPrimaryDisplay().workArea;
+  // 2026-11-11：物理边界跟着窗口所在的屏幕走，副屏上不会一步跳回主屏
+  const area = displayOf(b).workArea;
   const minX = area.x;
   const maxX = area.x + area.width - b.width;
   const target = Math.min(Math.max(walk.targetX, minX), maxX);
@@ -1078,6 +1156,31 @@ app.whenReady().then(() => {
     return;
   }
   log('window created ' + JSON.stringify(curBounds) + ' petZone=' + JSON.stringify(petZone()));
+
+  /*
+   * 2026-11-11（P0）：兜底「找得回」。
+   * 拖拽已经夹边界了，但还有几种漏网：拔掉副屏、改分辨率、远程桌面切换、
+   * 以及窗口被系统挪到可视区外。每 5 秒看一眼：窗口在所有显示器上的
+   * 可见面积不足三成，就把它放回光标所在屏幕的右下角。
+   */
+  const watchdog = setInterval(() => {
+    if (!win || win.isDestroyed()) return;
+    const b = win.getBounds();
+    const area = Math.max(1, b.width * b.height);
+    if (visibleAreaOf(b) < area * 0.3) recenterPet('窗口掉到屏幕外了');
+  }, 5000);
+  watchdog.unref?.();
+
+  // 显示器变化（插拔、改分辨率、缩放）时立刻重新夹一次
+  const reclamp = () => {
+    if (!win || win.isDestroyed()) return;
+    const b = win.getBounds();
+    const safe = clampToDisplay(b.x, b.y, b.width, b.height);
+    if (safe.x !== b.x || safe.y !== b.y) movePetTo(safe.x, safe.y);
+  };
+  screen.on('display-metrics-changed', reclamp);
+  screen.on('display-removed', reclamp);
+  screen.on('display-added', reclamp);
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
