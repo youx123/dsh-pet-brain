@@ -23,7 +23,13 @@ function log(...args) {
     /* 日志失败不能影响启动 */
   }
 }
-log('boot argv=' + process.argv.slice(2).join(' '));
+// 2026-11-11（P2）：argv 里有 --token，原样写进日志等于把令牌落在 %TEMP% 里，
+// 同机别的进程一读就能调 /pet-brain/*。打日志前先掩掉。
+const maskedArgv = process.argv
+  .slice(2)
+  .map((a) => (/^--token=/i.test(a) ? '--token=***' : a))
+  .join(' ');
+log('boot argv=' + maskedArgv);
 
 /**
  * 窗口平时就贴着桌宠本身：桌宠 16:9 占满窗口宽度，窗口贴在屏幕右下角。
@@ -92,7 +98,13 @@ function tokenFromArgv(argv) {
   const v = arg.slice('--token='.length).trim();
   return TOKEN_RE.test(v) ? v : '';
 }
-let PET_TOKEN = tokenFromArgv(process.argv) || readTokenFile();
+let PET_TOKEN = (() => {
+  // 2026-11-11（P2）：优先用环境变量。命令行参数在 Windows 上任何进程都能通过
+  // WMI 读到，等于把令牌摆在桌面上；环境变量只有本进程和它的父进程看得到。
+  const fromEnv = String(process.env.PET_BRAIN_TOKEN ?? '').trim();
+  if (TOKEN_RE.test(fromEnv)) return fromEnv;
+  return tokenFromArgv(process.argv) || readTokenFile();
+})();
 
 /**
  * 独立的 userData 目录：Electron 默认按包名共用一个缓存目录，
@@ -124,8 +136,12 @@ if (process.platform === 'win32') {
 const gotLock = app.requestSingleInstanceLock();
 log('singleLock=' + gotLock);
 if (!gotLock) {
-  log('无锁，退出');
-  app.quit();
+  // 2026-11-11（P2）：退出码用 3 而不是 0。
+  // stop→start 连点的时候，上一个进程刚被 kill、锁还没释放，新进程拿不到锁；
+  // 以前 app.quit() 是 0，宿主那边的自动重启看到「正常退出」就不管了，
+  // 结果界面说已启动、窗口永远不出现。非 0 退出会触发退避重启（1s 后重试）。
+  log('无锁，退出（code=3，让宿主稍后重试）');
+  app.exit(3);
 }
 
 /**
@@ -166,6 +182,8 @@ app.on('second-instance', (_evt, argv) => {
 
 let win = null;
 let petWidth = DEFAULT_PET_W;
+/** 渲染进程连续崩溃次数：成功加载一次就清零，用来做重载退避（P2-11）。 */
+let crashReloads = 0;
 /**
  * 当前是否整窗点击穿透（渲染端按光标是否压在宠物身上翻转）。
  *
@@ -416,6 +434,8 @@ function createWindow() {
   });
   // paintWhenInitiallyHidden:false 时 ready-to-show 可能永不触发，补一次兜底
   win.webContents.once('did-finish-load', () => {
+    // 能加载出页面就说明渲染进程是好的，把崩溃计数清零，下次真崩重新从 1s 起退避。
+    crashReloads = 0;
     // 句柄要存着：窗口重建（render-process-gone 自愈、second-instance 换源）时
     // 上一轮的排障定时器还在跑，3.5 秒后会打到新窗口上，串成莫名其妙的截图/面板。
     if (debugTimer) clearTimeout(debugTimer);
@@ -424,6 +444,10 @@ function createWindow() {
       if (!win || win.isDestroyed()) return;
       // 排障用：设了 PET_BRAIN_AUTO_PANEL 就把对应面板打开再截图
       const auto = process.env.PET_BRAIN_AUTO_PANEL;
+      // 2026-11-11（P2）：这一整套只有排障时才跑。以前每次启动都会在 3.5 秒后
+      // 截一张图写进 %TEMP%，生产启动也照跑 —— 白写磁盘，还留个没人看的文件。
+      const wantShot = process.env.PET_BRAIN_SHOT === '1';
+      if (!auto && !wantShot) return;
       if (auto) {
         try {
           if (auto === 'throw') {
@@ -587,17 +611,29 @@ function createWindow() {
   });
   win.webContents.on('render-process-gone', (_e, d) => {
     log('renderer gone ' + JSON.stringify(d));
-    // 渲染进程崩了以前只记一行日志：窗口留成一块空白，60ms 轮询还在跑，
-    // 宿主那边还显示"helper 活着"。这里自己重载一次。
+    // 2026-11-11（P2）：以前固定 1 秒重载一次，真崩（OOM/GPU）时变成每秒重建
+    // 一个渲染进程，CPU 和日志一起涨，永远停不下来。改成指数退避，三次后停手
+    // 并把窗口收起 —— 宿主那边的看门狗会把它重新居中/拉起。
+    crashReloads += 1;
+    if (crashReloads > 3) {
+      log('renderer 连续崩溃 ' + crashReloads + ' 次，停止自动重载');
+      try {
+        if (win && !win.isDestroyed()) win.hide();
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+    const delay = 1000 * 2 ** (crashReloads - 1); // 1s / 2s / 4s
     setTimeout(() => {
       if (!win || win.isDestroyed()) return;
       try {
         win.webContents.reload();
-        log('renderer reloaded');
+        log('renderer reloaded（第 ' + crashReloads + ' 次，延迟 ' + delay + 'ms）');
       } catch (err) {
         log('reload fail ' + (err?.message || err));
       }
-    }, 1000);
+    }, delay);
   });
   // Electron 35 起 console-message 改成只传一个 details 对象（位置参数已废弃，47 会移除）
   win.webContents.on('console-message', (_e, details) => {
