@@ -834,6 +834,10 @@ let THINK_DELAY_MS = 4_000;
   /** 上一次看到的心情档位，用来判断"心情变了没有"（空串 = 还没看到过） */
   let lastMoodBand = '';
 
+  /** 轮询闸：上一次还没回来就不发新的；pollSkipped 只用来排障 */
+  let pollInFlight = false;
+  let pollSkipped = 0;
+
   /** 落地压扁：主进程物理算出撞击强度后回调这里 */
   window.petDesk.onLand?.((info) => {
     lastLand = info?.impact ?? 0;
@@ -1877,6 +1881,15 @@ let THINK_DELAY_MS = 4_000;
    */
   let pollSeq = 0;
   async function poll() {
+    // 2026-11-12 修（桌宠审计）：轮询没有「上一次还在跑」的闸。
+    // 宿主卡一下（它要读记忆库、算图谱），2 秒一次的定时器照样往里塞请求 ——
+    // 实测最多堆到二十来个并发 fetch，越卡越堆、越堆越卡。
+    // 现在同一时刻只允许一个在飞，这一轮的定时器直接跳过，等下一轮。
+    if (pollInFlight) {
+      pollSkipped += 1;
+      return;
+    }
+    pollInFlight = true;
     const mySeq = ++pollSeq;
     try {
       const st = await api('/pet-brain/state');
@@ -2009,6 +2022,10 @@ let THINK_DELAY_MS = 4_000;
       }
     } catch (e) {
       if (!polledOnce) ping('state.fail', String(e?.message || e));
+    } finally {
+      // 无论成功、失败还是提前 return（mySeq 过期那条不算提前返回，走的是 return 之后
+      // 的 finally 语义），这里都要放闸，否则一次异常就把轮询永久卡死。
+      pollInFlight = false;
     }
   }
 

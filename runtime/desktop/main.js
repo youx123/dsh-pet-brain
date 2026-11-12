@@ -1206,6 +1206,13 @@ ipcMain.handle('pet:env', (e) => {
   };
 });
 
+/**
+ * 看门狗定时器句柄。2026-11-12 从 whenReady 的块级 const 提到模块级：
+ * 以前它是块内 const，谁也拿不到、也就永远清不掉。窗口被重建（activate）时
+ * 会再挂一个，越挂越多，每个都在每 5 秒读一次边界。
+ */
+let watchdog = null;
+
 app.whenReady().then(() => {
   // 没抢到锁说明已经有宠物在跑：这时候只该退出，别再开一个窗口闪一下
   if (!gotLock) return;
@@ -1233,7 +1240,8 @@ app.whenReady().then(() => {
    * 以及窗口被系统挪到可视区外。每 5 秒看一眼：窗口在所有显示器上的
    * 可见面积不足三成，就把它放回光标所在屏幕的右下角。
    */
-  const watchdog = setInterval(() => {
+  if (watchdog) clearInterval(watchdog);
+  watchdog = setInterval(() => {
     if (!win || win.isDestroyed()) return;
     const b = win.getBounds();
     const area = Math.max(1, b.width * b.height);
