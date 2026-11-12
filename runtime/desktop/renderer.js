@@ -221,9 +221,19 @@ let THINK_DELAY_MS = 4_000;
     // 刚干完活：庆祝一下
     if (lastWorkDoneAt && now - lastWorkDoneAt < 40_000) return pickDiff(['工作状态-雀跃庆祝', '轻快摇摆舞']);
     const idleFor = now - Math.max(lastWorkDoneAt, lastWorkBusyAt, bootedAt);
+    // 2026-11-12：桌面这只以前从来不跟心情走 —— 空闲时就那固定的六七组动作轮着来，
+    // 宿主 lib/mood-anim.js 算好的动作池只在点一下、回一句话的时候才用得上。
+    // 浏览器半侧早就在用 data.actions 了，桌面半侧漏了，等于同一只宠物两个脾气。
+    // 现在待机时按 55% 的概率从心情池里抽，其余扔给活动状态（干活闲了/刚闲下来）那几组。
+    const moodPool = Array.isArray(state?.actions) ? state.actions.filter(Boolean) : [];
+    const withMood = (fallback, chance = 0.55) => {
+      if (moodPool.length === 0) return pickDiff(fallback);
+      if (Math.random() < chance) return pickDiff(moodPool);
+      return pickDiff(fallback);
+    };
     // 闲过三分钟才轮到"闲到发慌"那一组
-    if (idleFor > 3 * 60_000) return pickDiff(['超大伸懒腰', '哈欠连天', '撸猫', '照镜子']);
-    return pickDiff(['东张西望', '悠闲哼歌', '原地漂浮踏步', '三球抛接', '摇扇纳凉', '踢毽子']);
+    if (idleFor > 3 * 60_000) return withMood(['超大伸懒腰', '哈欠连天', '撸猫', '照镜子']);
+    return withMood(['东张西望', '悠闲哼歌', '原地漂浮踏步', '三球抛接', '摇扇纳凉', '踢毽子']);
   }
 
   const blobCache = new Map();
@@ -820,6 +830,9 @@ let THINK_DELAY_MS = 4_000;
 
   /** 上次换情绪动作的时间，避免每轮轮询都抽搐 */
   let lastActionSwap = 0;
+
+  /** 上一次看到的心情档位，用来判断"心情变了没有"（空串 = 还没看到过） */
+  let lastMoodBand = '';
 
   /** 落地压扁：主进程物理算出撞击强度后回调这里 */
   window.petDesk.onLand?.((info) => {
@@ -1904,6 +1917,27 @@ let THINK_DELAY_MS = 4_000;
       } else if (w && w.status === 'running') {
         lastWorkBusyAt = Date.now();
       }
+      // 2026-11-12：心情档位变了就立刻换一个同档的动作。
+      // 原来只有待机轮换（30~70 秒一次）会重新抽，档位早变了画面还挂着上一个表情。
+      const bandNow = state?.mood?.band?.id || 'unknown';
+      if (
+        lastMoodBand &&
+        bandNow !== lastMoodBand &&
+        !busyScene &&
+        !dragging &&
+        !sleeping &&
+        !walking &&
+        panelKind === ''
+      ) {
+        const pool = Array.isArray(state?.actions) ? state.actions.filter(Boolean) : [];
+        if (pool.length > 0) {
+          lastActionSwap = Date.now();
+          playAnim(pick(pool), true);
+          ping('mood.band', bandNow);
+        }
+      }
+      lastMoodBand = bandNow;
+
       // 有动机的动作池：别在忙、睡着、追饭、走着、开着面板的时候插播。
       // 间隔改成 30~70 秒随机 —— 以前固定 14 秒，节奏太像机器。
       if (!dragging && !sleeping && baifanPhase < 0 && !walking && panelKind === '') {
