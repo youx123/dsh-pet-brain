@@ -272,20 +272,21 @@ function displayOf(bounds = curBounds) {
 
 /**
  * 把窗口夹回屏幕可见区域。
- * 允许横向探出去一半（贴边时宠物能露出半个身子），纵向留出徽章和至少 40% 的高度。
+ *
+ * 2026-11-12：改成按**宠物本体**夹，四条边都贴屏幕工作区。
+ * 旧版按窗口算（横向允许探出一半、纵向留 20%/40%），结果是：
+ * 顶部抛不到屏幕顶、落地时宠物悬空一截 —— 看起来就是「碰撞范围是那块界面，不是屏幕」。
  */
 function clampToDisplay(x, y, width = curBounds.width, height = curBounds.height) {
   const area = displayOf({ x, y, width, height }).workArea;
-  const half = Math.round(width * 0.5);
-  const keep = Math.round(height * 0.4);
-  const minX = area.x - half;
-  const maxX = area.x + area.width - half;
-  const minY = area.y - Math.round(height * 0.2);
-  const maxY = area.y + area.height - BADGE_SPACE - keep;
-  return {
-    x: Math.min(maxX, Math.max(minX, Math.round(x))),
-    y: Math.min(maxY, Math.max(minY, Math.round(y))),
-  };
+  const box = petBoxIn(width, height);
+  const minX = area.x - box.x;
+  const maxX = area.x + area.width - box.x - box.w;
+  const minY = area.y - box.y;
+  const maxY = area.y + area.height - box.y - box.h;
+  const nx = maxX < minX ? minX : Math.min(maxX, Math.max(minX, Math.round(x)));
+  const ny = maxY < minY ? minY : Math.min(maxY, Math.max(minY, Math.round(y)));
+  return { x: nx, y: ny };
 }
 
 /** 这个矩形在所有显示器上露出来的面积（平方像素）。 */
@@ -695,7 +696,14 @@ function setIgnore(next) {
  */
 let petBox = null;
 
-function petZone() {
+/**
+ * 宠物本体在窗口里的位置（相对窗口左上角）。
+ *
+ * 2026-11-12：碰撞范围改成「屏幕」之后，所有边界都按**宠物本体**算，不再按窗口算 ——
+ * 窗口上面那一大块是 HUD 留白（320px），拿窗口当边界的话宠物永远够不到屏幕顶，
+ * 而拿窗口的 20%/40% 当边界又会让落地悬在半空。
+ */
+function petBoxIn(width = curBounds.width, height = curBounds.height) {
   const w = Math.round(petWidth);
   const h = Math.round((petWidth * 9) / 16);
   // 没采样到就退回保守内缩，保证至少点得到
@@ -705,10 +713,30 @@ function petZone() {
   const x1 = Math.round(w * box.right);
   const y1 = Math.round(h * box.bottom);
   return {
-    x: Math.round((curBounds.width - w) / 2) + x0,
-    y: Math.round(curBounds.height - BADGE_SPACE - h) + y0,
+    x: Math.round((width - w) / 2) + x0,
+    y: Math.round(height - BADGE_SPACE - h) + y0,
     w: Math.max(24, x1 - x0),
     h: Math.max(24, y1 - y0),
+  };
+}
+
+function petZone() {
+  return petBoxIn(curBounds.width, curBounds.height);
+}
+
+/**
+ * 宠物本体在**屏幕**上能待的范围（窗口坐标）。
+ * 四条边都是屏幕工作区：左/右/上/下 —— 老大 2026-11-12 定的口径，
+ * 碰撞范围是屏幕，不是桌面端那块界面。
+ */
+function petLimits(width = curBounds.width, height = curBounds.height, area = null) {
+  const r = area || displayOf({ x: curBounds.x, y: curBounds.y, width, height }).workArea;
+  const box = petBoxIn(width, height);
+  return {
+    minX: r.x - box.x,
+    maxX: r.x + r.width - box.x - box.w,
+    minY: r.y - box.y,
+    maxY: r.y + r.height - box.y - box.h,
   };
 }
 
@@ -920,8 +948,11 @@ function physTick() {
   if (dt > 0.1) dt = 0.1;
 
   const b = win.getBounds();
-  // 2026-11-11：物理边界跟着窗口所在的屏幕走，副屏上不会一步跳回主屏
+  // 2026-11-12：碰撞范围 = 整块屏幕的工作区，按「宠物本体」算。
+  // 旧版这里按窗口算顶部/地面，跟 clampToDisplay 的窗口口径打架，
+  // 结果宠物永远够不到屏幕顶、落地还悬空一截。
   const area = displayOf(b).workArea;
+  const limits = petLimits(b.width, b.height, area);
 
   phys.vy += PHYS.GRAVITY * dt;
   phys.vx *= PHYS.AIR_DRAG;
@@ -929,26 +960,22 @@ function physTick() {
   let y = b.y + phys.vy * dt;
 
   // 左右墙
-  if (x < area.x) {
-    x = area.x;
+  if (x < limits.minX) {
+    x = limits.minX;
     phys.vx = -phys.vx * PHYS.WALL_BOUNCE;
-  } else if (x + b.width > area.x + area.width) {
-    x = area.x + area.width - b.width;
+  } else if (x > limits.maxX) {
+    x = limits.maxX;
     phys.vx = -phys.vx * PHYS.WALL_BOUNCE;
   }
 
-  // 顶部边界按"宠物头顶"算：窗口上方那一大块是 HUD 留白，拿窗口顶当边界的话
-  // 宠物永远够不到屏幕顶；反过来说，只按窗口顶钳制又会让宠物整只飞出屏幕不要紧。
-  const petH = Math.round((petWidth * 9) / 16);
-  const ceil = area.y - (b.height - BADGE_SPACE - petH);
-  if (y < ceil) {
-    y = ceil;
+  // 天花板：宠物头顶到屏幕顶就弹回来
+  if (y < limits.minY) {
+    y = limits.minY;
     phys.vy = Math.abs(phys.vy) * PHYS.WALL_BOUNCE;
   }
 
-  // 左右墙 + 地面。地面按"宠物脚底"算：窗口底部还留着 BADGE_SPACE 给状态徽章，
-  // 用窗口底当地面会让宠物悬空一截。
-  const floor = area.y + area.height - (b.height - BADGE_SPACE);
+  // 地面：宠物脚底贴屏幕底（窗口底下还留着 BADGE_SPACE 给状态徽章）
+  const floor = limits.maxY;
   if (y >= floor) {
     y = floor;
     const impact = Math.abs(phys.vy);
