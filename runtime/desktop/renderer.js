@@ -158,7 +158,13 @@ let THINK_DELAY_MS = 4_000;
    */
   async function api(path, init = {}) {
     const ctrl = new AbortController();
-    const ms = init.timeoutMs ?? 45_000;
+    // 2026-11-12（桌宠审计 中危 C）：客户端超时以前是 45 秒，
+    // 但宿主那条会话要跑满 90 秒（lib/index.js SESSION_REPLY_TIMEOUT_MS）。
+    // 结果就是：跑到 50~80 秒时桌宠先 Abort、界面显示「没接上话」，
+    // 宿主那边照样跑完 90 秒，还把这一轮写进了共享大脑 ——
+    // 老大看着像失败，额度已经花了，记忆库里还多了一条。
+    // 现在客户端比宿主多留 20 秒余量。
+    const ms = init.timeoutMs ?? 110_000;
     const timer = setTimeout(() => ctrl.abort(), ms);
     try {
       // file:// 页面对宿主来说是跨源，必须带上令牌，否则一律 403。
@@ -1417,8 +1423,8 @@ let THINK_DELAY_MS = 4_000;
 
   const DIM_LABEL = {
     happy: '开心',
-    calm: '平静',
-    sweet: '甜',
+    calm: '踏实',
+    sweet: '甜蜜',
     heartache: '心疼',
     worry: '担心',
     sad: '难过',

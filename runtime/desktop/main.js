@@ -85,7 +85,14 @@ let HOST_ORIGIN = (() => {
 const TOKEN_RE = /^[0-9a-f]{32,128}$/i;
 function readTokenFile() {
   try {
-    const p = path.join(require('node:os').homedir(), '.dsh', 'dsh-pet-brain', 'token');
+    // 2026-11-12（桌宠审计 中低 F）：这里原来写死 homedir()/.dsh，
+    // 但插件本体的口径是 DSH_HOME 优先（lib/brain.js 的 dshHome()，
+    // lib/token.js 也用它）。设了 DSH_HOME 的机器上手动起窗口会读错文件，
+    // 令牌读到空 → 所有请求 403。桌面助手是独立进程引不到 lib/brain.js，
+    // 所以这里把同一套口径抄一份。
+    const env = process.env.DSH_HOME;
+    const home = (typeof env === 'string' && env.trim() !== '') ? env.trim() : path.join(require('node:os').homedir(), '.dsh');
+    const p = path.join(home, 'dsh-pet-brain', 'token');
     const v = String(fs.readFileSync(p, 'utf8')).trim();
     return TOKEN_RE.test(v) ? v : '';
   } catch {
