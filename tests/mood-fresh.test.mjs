@@ -55,7 +55,13 @@ const none = effectiveMood(null, now)
 check('没有数据也不炸', none.mood === 50 && none.band.id === 'unknown')
 check('没有数据也说明', none.note.includes('没有心情数据'), none.note)
 
-// 6. 边界：正好 6 小时不算旧、正好 24 小时不算过期
+// 6. unknown 标记：界面靠它决定显示数字还是破折号
+check('新鲜：unknown=false', bFresh.unknown === false)
+check('旧但可用：unknown=false', bStale.unknown === false)
+check('过期：unknown=true', bCold.unknown === true)
+check('没有数据：unknown=true', none.unknown === true)
+
+// 7. 边界：正好 6 小时不算旧、正好 24 小时不算过期
 check('六小时整不算旧', moodFreshness(mood(6), now).stale === false)
 check('二十四小时整不算过期', moodFreshness(mood(24), now).cold === false)
 check('常量对齐', MOOD_STALE_MS === 6 * 3600000 && MOOD_COLD_MS === 24 * 3600000)
