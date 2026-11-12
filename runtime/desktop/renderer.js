@@ -1823,10 +1823,14 @@ let THINK_DELAY_MS = 4_000;
       return;
     }
     const big = el('div', 'big');
-    big.appendChild(el('b', null, String(Math.round(m.mood))));
+    // 数据太旧时宿主给的是中性兜底值 50，不是真心情 —— 印成「—」。
+    // 直接写 50，老大看了会以为这会儿心情就是 50 分。
+    big.appendChild(el('b', null, m.unknown ? '—' : String(Math.round(m.mood))));
     big.appendChild(el('span', 'pill', m.band?.label || '—'));
     infoEl.appendChild(big);
-    const dims = m.dims || {};
+    if (m.note) infoEl.appendChild(el('div', 'warn', String(m.note).slice(0, 80)));
+    // 不知道的时候别摆七行全零的进度条，那是噪声不是信息。
+    const dims = m.unknown ? {} : m.dims || {};
     for (const key of Object.keys(DIM_LABEL)) {
       const v = Math.max(0, Math.min(10, Number(dims[key]) || 0));
       const row = el('div', 'dim');
@@ -1855,7 +1859,10 @@ let THINK_DELAY_MS = 4_000;
       return;
     }
     badge.hidden = false;
-    badge.textContent = `${m.mood} · ${m.band?.label || '—'}`;
+    // 同 renderMood：data 太旧时那个 50 是兜底值，不印数字，省得被当真。
+    badge.textContent = m.unknown
+      ? `— · ${m.band?.label || '—'}`
+      : `${m.mood} · ${m.band?.label || '—'}`;
     // 有话没显示出来（面板/菜单开着，气泡被压住了）→ 徽章上挂个提示
     if (unread > 0) badge.textContent += ` · 💬${unread}`;
   }
