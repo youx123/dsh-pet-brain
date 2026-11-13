@@ -496,6 +496,126 @@ let THINK_DELAY_MS = 4_000;
    * 宿主那边已经记过账的（/speak、/chat 的回复）不要再记一遍，
    * 否则账本里同一条会出现两次。
    */
+  /**
+   * 2026-11-13：桌宠开口时同步念一遍。
+   *
+   * 宿主那边的 /pet-brain/tts 是跨源接口，必须带 x-pet-token；
+   * <audio src> 塞不了自定义头，所以先用 fetch 取回二进制，再转 Blob URL 播。
+   * 播音失败一律静默 —— 老大宁可没声音，也不要桌宠卡一下。
+   */
+  let voiceOn = (() => {
+    try {
+      return localStorage.getItem('pet-brain:voice') !== '0';
+    } catch {
+      return true;
+    }
+  })();
+  let voiceAudio = null;
+  let voiceToken = 0;
+  // 最近一次播音的结果。排障时 __petDeskTest.speak 会把它一起带出来 ——
+  // 浏览器里没声音是「没合成」还是「被自动播放策略拦了」，只看这个就分得清。
+  let voiceLast = { at: 0, state: 'idle', bytes: 0, error: '' };
+
+  /**
+   * 2026-11-13：念之前先把表情摘掉 —— 老大要的是"表情不用说，只说文字"。
+   * 气泡里带的表情来源有两处：共享大脑配的默认表情（withEmoji 追加），
+   * 以及回复正文里自带的 emoji。交给 TTS 的话，轻则念出"鱼"这种词，重则念成一串乱码。
+   * 顺手清掉 [偷笑]（笑）这类文字版表情备注，剩下的没有可读字就整条不念。
+   */
+  const EMOJI_WORD =
+    /[（(\[【]\s*(?:偷笑|笑死|大笑|笑哭|笑|哭|流泪|叹气|无语|沉默|汗|尴尬|赞|点赞|比心|耶|抱抱|加油|鼓掌|思考|疑惑|惊讶|吃瓜|狗头|喵|嗷|哼|得意|委屈|可爱|开心|难过|生气)[^\u4e00-\u9fa5]{0,2}\s*[)）\]】]/g;
+
+  function speakableText(text) {
+    const stripped = String(text || '')
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ') // markdown 图片
+      .replace(/https?:\/\/\S+/g, ' ') // 网址
+      .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}\u{200D}\u{20E3}\u{1F1E6}-\u{1F1FF}]/gu, ' ')
+      .replace(/[\u{1F3FB}-\u{1F3FF}]/gu, ' ') // 肤色修饰
+      .replace(EMOJI_WORD, ' ')
+      .replace(/[\s\u3000]+/g, ' ')
+      .trim();
+    // 只剩标点符号的话，也不值得开口
+    if (!/[\p{L}\p{N}]/u.test(stripped)) return '';
+    return stripped.slice(0, 300);
+  }
+
+  async function speakAloud(text) {
+    if (!voiceOn) {
+      voiceLast = { at: Date.now(), state: 'off', bytes: 0, error: '' };
+      return;
+    }
+    const plain = speakableText(text);
+    if (!plain) {
+      // 整条都是表情：不合成、不出声，气泡照旧显示
+      voiceLast = { at: Date.now(), state: 'empty', bytes: 0, error: '' };
+      return;
+    }
+    const mine = ++voiceToken;
+    try {
+      const headers = {};
+      if (PET_TOKEN) headers['x-pet-token'] = PET_TOKEN;
+      const res = await fetch(HOST + '/pet-brain/tts?text=' + encodeURIComponent(plain), {
+        headers,
+        signal: AbortSignal.timeout?.(25_000),
+      });
+      if (!res.ok) {
+        voiceLast = { at: Date.now(), state: 'http-' + res.status, bytes: 0, error: '' };
+        return;
+      }
+      if (mine !== voiceToken) return;
+      const blob = await res.blob();
+      if (mine !== voiceToken) return;
+      voiceLast = { at: Date.now(), state: 'loaded', bytes: blob.size, error: '' };
+      const url = URL.createObjectURL(blob);
+      if (voiceAudio) {
+        try {
+          voiceAudio.pause();
+          URL.revokeObjectURL(voiceAudio.src);
+        } catch {
+          /* 旧的那条已经废了，随它去 */
+        }
+      }
+      const audio = new Audio(url);
+      voiceAudio = audio;
+      audio.onended = () => URL.revokeObjectURL(url);
+      // 浏览器可能拦自动播放；拦了就当没有声音，不弹任何东西
+      const played = audio.play();
+      if (played && typeof played.then === 'function') {
+        played.then(
+          () => {
+            voiceLast.state = 'playing';
+          },
+          (err) => {
+            voiceLast = { at: Date.now(), state: 'blocked', bytes: voiceLast.bytes, error: String(err?.message || err) };
+          },
+        );
+      }
+    } catch (err) {
+      // 合成失败、断网、令牌过期 —— 都不影响气泡
+      voiceLast = { at: Date.now(), state: 'error', bytes: 0, error: String(err?.message || err) };
+    }
+  }
+
+  /**
+   * 「念不念出声」的开关。默认念；右键菜单里能关，关掉的状态记在 localStorage。
+   */
+  function toggleVoice() {
+    voiceOn = !voiceOn;
+    try {
+      localStorage.setItem('pet-brain:voice', voiceOn ? '1' : '0');
+    } catch {
+      /* 存不了就算了，这次会话照用 */
+    }
+    if (!voiceOn && voiceAudio) {
+      try {
+        voiceAudio.pause();
+      } catch {
+        /* 已经停了 */
+      }
+    }
+    say(voiceOn ? '行，我念出声' : '好，我就显示字', 6000, '');
+  }
+
   function say(text, ms = 8000, emojiKey = '', opts = {}) {
     if (!text) return;
     /**
@@ -522,6 +642,8 @@ let THINK_DELAY_MS = 4_000;
         })
         .catch(() => {});
     }
+    // 2026-11-13：不管是气泡还是面板，开口就念 —— 面板开着的时候老大更看不见字。
+    if (!silent) void speakAloud(text);
     // 面板开着就没地方站气泡了：写进面板 / 在徽章上留未读，话不能丢
     if (typeof panelKind === 'string' && panelKind) {
       ping('say.panel', String(text).slice(0, 20));
@@ -1395,6 +1517,7 @@ let THINK_DELAY_MS = 4_000;
       ['🍚 去吃饭', () => startBaifan()],
       [sleeping ? '☀️ 叫醒它' : '😴 睡一觉', () => (sleeping ? wakeUp() : startSleep())],
       [quiet ? '🔔 打开自动互动' : '🔕 关掉自动互动', () => toggleQuiet()],
+      [voiceOn ? '🔇 只显示文字' : '🗣️ 也念出声', () => toggleVoice()],
       // 2026-11-11：找不到 / 跑到屏幕外面时的手动兜底
       ['🎯 重新居中', () => window.petDesk.recenter?.()],
       null,
@@ -2161,6 +2284,9 @@ let THINK_DELAY_MS = 4_000;
         say(res.text, 15000, res.emoji || '', { kind: 'proactive' });
         out.push('bubble=' + (bubble.hidden ? 'hidden' : 'shown'));
         out.push('emojiImg=' + bubble.querySelectorAll('img.emoji').length);
+        // 等合成 + 起播，把播音结果也报出来（没声音时靠它分清是没合成还是被拦）
+        await new Promise((r) => setTimeout(r, 2500));
+        out.push('voice=' + JSON.stringify(voiceLast));
       }
       return out.join(' | ');
     },

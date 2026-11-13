@@ -73,6 +73,7 @@ dsh plugin add <克隆下来的目录绝对路径>
 | GET | `/pet-brain/env` | 宿主运行时探测：是不是 Electron 主进程、能不能拿到 `BrowserWindow` |
 | GET / POST | `/pet-brain/desktop` | 桌面助手状态；POST `{action:'start'\|'stop'\|'restart'}` 起停独立窗口 |
 | GET / POST | `/pet-brain/chatlog` | 桌宠自己的会话账本（气泡、聊天面板、主动搭话同一份）；POST 追加一条 |
+| GET | `/pet-brain/tts?text=…` | 把一句话合成为 MP3（`audio/mpeg`）。音色/语速/音调默认取共享大脑 `voice.style.speech`，可用 `&voice=` 临时换；合成失败回 502，渲染端照旧只显示文字 |
 
 ## 心情档位 → 动作
 

@@ -13,6 +13,10 @@ const { app, BrowserWindow, ipcMain, screen, Menu } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 
+// 2026-11-13：桌宠开口要念出声。Chromium 默认拦「没有用户手势的自动播放」，
+// 桌宠多数时候是主动说话（没人点它），必须把这个策略放开，否则 Audio.play() 直接 reject。
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+
 /** 排障日志：helper 是独立进程，出了问题界面上没有任何痕迹，只能靠它 */
 const LOG = path.join(require('node:os').tmpdir(), 'dsh-pet-brain-desktop.log');
 function log(...args) {
