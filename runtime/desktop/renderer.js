@@ -203,6 +203,39 @@ let THINK_DELAY_MS = 4_000;
    * 突然撸猫，看着就是个会动的贴纸。现在只看三件事：
    * 在不在干活、刚说完话没、真闲了多久。
    */
+  /**
+   * 2026-11-19 扩池：老大说「一直都是那几个动作」。
+   * 查下来素材 52 个一个不缺，是**挑法太窄** —— 干活时只在「写代码/敲桌面」
+   * 两帧之间来回，闲下来也只在六七组里轮，一天里看得见的不到二十个。
+   * 现在按三件事分池：在干什么、现在几点、闲了多久。
+   */
+  const WORK_FOCUS = [
+    '写代码', '原地敲击桌面互动', '工作状态-忙碌点按',
+    '工作状态-思考冒泡', '深度思考碎碎念', '工作状态-原地踱步张望',
+  ];
+  /** 干活当中抬头喘口气用的，别让它一直闷在屏幕前 */
+  const WORK_BREAK = ['东张西望', '原地漂浮踏步', '摇扇纳凉', '照镜子', '超大伸懒腰', '哈欠连天', '三球抛接'];
+  /** 话没说完：还在讲的动作最贴身 */
+  const TALKING = ['鲸鱼吐泡泡特效', '轻快摇摆舞', '可爱宅舞', '点击回应-元气挥手'];
+  /** 刚干完活：庆祝 */
+  const JUST_DONE = ['工作状态-雀跃庆祝', '轻快摇摆舞', '点击回应-开心跃动', '收红包'];
+  /**
+   * 按时段分的闲逛池（from ≤ 时 < to）。
+   * 只放**能无缝循环**的动作：一次性的那些（拆礼物、放烟花、睡觉三段）
+   * 塞进来会卡在第一帧，留给下面的彩蛋池。
+   */
+  const TIME_POOLS = [
+    { from: 5, to: 9, pool: ['超大伸懒腰', '哈欠连天', '照镜子', '待机呼吸休闲', '悠闲哼歌', '东张西望'] },
+    { from: 9, to: 12, pool: ['写代码', '三球抛接', '踢毽子', '螃蟹走路', '开心小跑', '照镜子', '撸猫'] },
+    { from: 12, to: 14, pool: ['期待开饭', '吃饭团', '吃饭·碗饭', '吃糖葫芦', '吃冰淇淋融化', '摇扇纳凉'] },
+    { from: 14, to: 18, pool: ['撸猫', '荡秋千', '玩游戏气急败坏', '吹气球', '踢毽子', '摇扇纳凉', '照镜子'] },
+    { from: 18, to: 21, pool: ['摇扇纳凉', '悠闲哼歌', '轻快摇摆舞', '可爱宅舞', '照镜子', '三球抛接'] },
+    { from: 21, to: 24, pool: ['碎碎念-发呆碎碎念', '深度思考碎碎念', '原地小憩沉眠', '鲸鱼吐泡泡特效', '照镜子'] },
+    { from: 0, to: 5, pool: ['原地小憩沉眠', '哈欠连天', '碎碎念-发呆碎碎念', '待机呼吸休闲'] },
+  ];
+  /** 罕见彩蛋：演一整套就回待机，闲得越久越容易撞上 */
+  const IDLE_EGG = ['放烟花', '拆礼物', '收红包', '蓝鲸现世', '荡秋千', '吹气球', '被吓一跳'];
+
   function pickMotivatedAnim() {
     const now = Date.now();
     // 抽中同一个等于没换，画面会僵在那儿 —— 先把自己现在演的那个剔掉
@@ -210,30 +243,31 @@ let THINK_DELAY_MS = 4_000;
       const rest = pool.filter((n) => n !== currentAnim);
       return pick(rest.length ? rest : pool);
     };
-    // 干活时多数还是干活的姿势，但隔一阵也得抬头看两眼、挪挪脚。
-    // 只在"写代码/敲桌面"两帧之间来回，一眼就是张会动的贴纸。
+    const hour = new Date(now).getHours();
+    const timePool = (TIME_POOLS.find((t) => hour >= t.from && hour < t.to) || TIME_POOLS[0]).pool;
+    // 干活时多数还是干活的姿势，隔一阵抬头看两眼、挪挪脚。
     if (lastWorkStatus === 'running') {
-      if (Math.random() < 0.22) return pickDiff(['东张西望', '原地漂浮踏步', '摇扇纳凉', '照镜子']);
-      return pickDiff(['写代码', '原地敲击桌面互动']);
+      if (Math.random() < 0.25) return { name: pickDiff(WORK_BREAK), once: false };
+      return { name: pickDiff(WORK_FOCUS), once: false };
     }
-    // 气泡还挂着说明话没说完：吐泡泡这种"还在讲"的动作最贴身
-    if (!bubble.hidden || now - lastSaidAt < 20_000) return pickDiff(['鲸鱼吐泡泡特效', '轻快摇摆舞']);
-    // 刚干完活：庆祝一下
-    if (lastWorkDoneAt && now - lastWorkDoneAt < 40_000) return pickDiff(['工作状态-雀跃庆祝', '轻快摇摆舞']);
+    if (!bubble.hidden || now - lastSaidAt < 20_000) return { name: pickDiff(TALKING), once: false };
+    if (lastWorkDoneAt && now - lastWorkDoneAt < 40_000) return { name: pickDiff(JUST_DONE), once: false };
     const idleFor = now - Math.max(lastWorkDoneAt, lastWorkBusyAt, bootedAt);
+    // 彩蛋：闲过五分钟之后偶尔演一整套大的（一次性的，演完自己回待机）
+    if (idleFor > 5 * 60_000 && Math.random() < 0.06) return { name: pick(IDLE_EGG), once: true };
     // 2026-11-12：桌面这只以前从来不跟心情走 —— 空闲时就那固定的六七组动作轮着来，
     // 宿主 lib/mood-anim.js 算好的动作池只在点一下、回一句话的时候才用得上。
     // 浏览器半侧早就在用 data.actions 了，桌面半侧漏了，等于同一只宠物两个脾气。
-    // 现在待机时按 55% 的概率从心情池里抽，其余扔给活动状态（干活闲了/刚闲下来）那几组。
+    // 2026-11-19：参与率从 55% 提到 70%，时段池接在剩下那 30% 上。
     const moodPool = Array.isArray(state?.actions) ? state.actions.filter(Boolean) : [];
-    const withMood = (fallback, chance = 0.55) => {
-      if (moodPool.length === 0) return pickDiff(fallback);
-      if (Math.random() < chance) return pickDiff(moodPool);
-      return pickDiff(fallback);
+    const withMood = (fallback, chance = 0.7) => {
+      if (moodPool.length === 0) return { name: pickDiff(fallback), once: false };
+      if (Math.random() < chance) return { name: pickDiff(moodPool), once: false };
+      return { name: pickDiff(fallback), once: false };
     };
     // 闲过三分钟才轮到"闲到发慌"那一组
-    if (idleFor > 3 * 60_000) return withMood(['超大伸懒腰', '哈欠连天', '撸猫', '照镜子']);
-    return withMood(['东张西望', '悠闲哼歌', '原地漂浮踏步', '三球抛接', '摇扇纳凉', '踢毽子']);
+    if (idleFor > 3 * 60_000) return withMood(['超大伸懒腰', '哈欠连天', '撸猫', '照镜子', '碎碎念-发呆碎碎念']);
+    return withMood(timePool);
   }
 
   const blobCache = new Map();
@@ -1953,17 +1987,18 @@ let THINK_DELAY_MS = 4_000;
     infoEl.appendChild(big);
     if (m.note) infoEl.appendChild(el('div', 'warn', String(m.note).slice(0, 80)));
     // 不知道的时候别摆七行全零的进度条，那是噪声不是信息。
-    const dims = m.unknown ? {} : m.dims || {};
+    // 2026-11-16：冷数据回落到 moodBase 时 mood 有数、dims 是空的 —— 同样按"不知道"画。
+    const dimsKnown = !m.unknown && m.dims && Object.keys(m.dims).length > 0;
     for (const key of Object.keys(DIM_LABEL)) {
-      const v = Math.max(0, Math.min(10, Number(dims[key]) || 0));
+      const v = dimsKnown ? Math.max(0, Math.min(10, Number(m.dims?.[key]) || 0)) : null;
       const row = el('div', 'dim');
       row.appendChild(el('i', null, DIM_LABEL[key]));
       const track = el('u');
       const fill = el('b');
-      fill.style.width = v * 10 + '%';
+      fill.style.width = (v === null ? 0 : v * 10) + '%';
       track.appendChild(fill);
       row.appendChild(track);
-      row.appendChild(el('em', null, String(Math.round(v))));
+      row.appendChild(el('em', null, v === null ? '—' : String(Math.round(v))));
       infoEl.appendChild(row);
     }
     if (m.reason) infoEl.appendChild(el('div', 'hint', String(m.reason).slice(0, 60)));
@@ -2090,7 +2125,11 @@ let THINK_DELAY_MS = 4_000;
         if (nowSwap - lastActionSwap > gap && nowSwap - lastReactionAt > 6_000) {
           lastActionSwap = nowSwap;
           const next = pickMotivatedAnim();
-          if (next) playAnim(next, true);
+          if (next?.name) {
+            // 2026-11-19：彩蛋动作演一次就回待机，循环播会卡在最后一帧
+            if (next.once) playAnim(next.name, false, 1, () => playAnim(IDLE_ANIM, true));
+            else playAnim(next.name, true);
+          }
         }
       }
 
@@ -2349,13 +2388,18 @@ let THINK_DELAY_MS = 4_000;
     },
 
     /** 动机池自检：只算出"此刻会挑哪个动作"，不真的播 */
-    motive: () =>
-      'next=' +
-      pickMotivatedAnim() +
-      ' busy=' +
-      lastWorkStatus +
-      ' idleMs=' +
-      (Date.now() - Math.max(lastWorkDoneAt, lastWorkBusyAt, bootedAt)),
+    motive: () => {
+      const next = pickMotivatedAnim();
+      return (
+        'next=' +
+        (next?.name ?? '') +
+        (next?.once ? '(once)' : '') +
+        ' busy=' +
+        lastWorkStatus +
+        ' idleMs=' +
+        (Date.now() - Math.max(lastWorkDoneAt, lastWorkBusyAt, bootedAt))
+      );
+    },
 
     /**
      * 作息自检：把"连轴转"的计时拨到 46 分钟，看会不会真的伸懒腰提醒。

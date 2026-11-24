@@ -9,7 +9,7 @@
  * 与浏览器半侧的区别：那个 `<video>` 挂在页面里，会跟着页面滚动、被祖先裁切；
  * 这里的窗口是 OS 级窗口，宠物停在桌面上，跟客户端窗口没有关系。
  */
-const { app, BrowserWindow, ipcMain, screen, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, Menu, session } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 
@@ -1221,6 +1221,30 @@ app.whenReady().then(() => {
   // 没抢到锁说明已经有宠物在跑：这时候只该退出，别再开一个窗口闪一下
   if (!gotLock) return;
   log('app ready');
+  /*
+   * 2026-11-24（DSH 0.2.3 兼容）：桌面窗是 file:// 加载的，页面里 fetch 宿主时
+   * Chromium 会自动补 `Origin: null` 与 `Sec-Fetch-Site: cross-site`；
+   * DSH 的来源闸门（dsh-client-connection 的 isTrustedApiRequest）对这两条全判 false，
+   * 于是 /pet-brain/* 一律 403 —— 宠物视频一个字节都拿不到，桌面窗只剩气泡。
+   * 这里把这两个头抹掉：没有 Origin 就走「同源缺省」分支，闸门放行。
+   * 只对宿主回环地址生效，不碰其它请求。
+   */
+  try {
+    session.defaultSession.webRequest.onBeforeSendHeaders({ urls: ['http://127.0.0.1:*/*'] }, (details, cb) => {
+      const headers = { ...details.requestHeaders };
+      let touched = false;
+      for (const k of Object.keys(headers)) {
+        const lk = k.toLowerCase();
+        if (lk === 'origin' || lk === 'sec-fetch-site' || lk === 'sec-fetch-mode' || lk === 'sec-fetch-dest') {
+          delete headers[k];
+          touched = true;
+        }
+      }
+      cb(touched ? { requestHeaders: headers } : {});
+    });
+  } catch (e) {
+    log('webRequest hook 装不上 ' + (e?.stack || String(e)));
+  }
   // 应用菜单在无边框窗口里也会响应 Alt 键，清掉
   Menu.setApplicationMenu(null);
   /*
